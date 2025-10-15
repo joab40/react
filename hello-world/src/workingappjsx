@@ -1,0 +1,243 @@
+import { useRef, useState } from "react";
+
+/**
+ * Vite/React – Minimal simvaliderare för Tempus "Statistikrapport Individuell" (.csv)
+ * Visar endast: OK + antal simmare + könsfördelning (Dam, Herr, Okänt)
+ */
+
+export default function App() {
+  const [rawText, setRawText] = useState("");
+  const [errors, setErrors] = useState([]);
+  const [validated, setValidated] = useState(false);
+  const [summary, setSummary] = useState(null);
+  const fileRef = useRef(null);
+
+  function handleFile(e) {
+    const f = e.target.files?.[0];
+    resetState();
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => setRawText(String(ev.target?.result || ""));
+    reader.readAsText(f, "utf-8");
+  }
+
+  function resetState() {
+    setErrors([]);
+    setValidated(false);
+    setSummary(null);
+  }
+
+  function detectDelimiter(sample) {
+    const sc = (sample.match(/;/g) || []).length;
+    const cc = (sample.match(/,/g) || []).length;
+    return sc >= cc ? ";" : ",";
+  }
+
+  function smartSplit(line, delimiter) {
+    const cols = [];
+    let cur = "", inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; continue; }
+      if (ch === delimiter && !inQuotes) { cols.push(cur.trim()); cur = ""; }
+      else { cur += ch; }
+    }
+    cols.push(cur.trim());
+    return cols.map((s) => s.replace(/^"|"$/g, "").trim());
+  }
+
+  function findTableStartAndParse(text) {
+    const delimiter = detectDelimiter(text.slice(0, 2000));
+    const lines = text.replace(/\r\n?/g, "\n").split("\n");
+
+    // Leta efter header-rad
+    let headerIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const L = lines[i];
+      if (/(Simidrottare|Namn)/.test(L) && /Gren/.test(L) && /Tid/.test(L)) {
+        headerIdx = i; break;
+      }
+    }
+    const allLines = headerIdx >= 0 ? lines.slice(headerIdx) : lines;
+    if (!allLines.length) return { headers: [], rows: [] };
+
+    const hdrs = smartSplit(allLines[0], delimiter);
+    const headerSet = new Set(hdrs.map((h) => h.trim()));
+
+    const body = allLines.slice(1)
+      .map((ln) => smartSplit(ln, delimiter))
+      .filter((cols) => cols.some((c) => (c || "").trim().length > 0))
+      .filter((cols) => {
+        let headerHits = 0;
+        for (const c of cols) if (headerSet.has((c || "").trim())) headerHits++;
+        return headerHits < 3 && (cols[0] || "").trim() !== "Placering";
+      });
+
+    const rows = body.map((cols) => {
+      const obj = {};
+      hdrs.forEach((h, i) => { obj[h.trim()] = (cols[i] ?? "").trim(); });
+      return obj;
+    });
+
+    return { headers: hdrs, rows };
+  }
+
+  function normalizeHeaderName(name) {
+    return String(name).toLowerCase()
+      .replace(/\s+/g, " ")
+      .replaceAll("å", "a").replaceAll("ä", "a").replaceAll("ö", "o");
+  }
+
+  function pickColumn(headers, candidates) {
+    const normMap = new Map(headers.map((h) => [normalizeHeaderName(h), h]));
+    for (const c of candidates) {
+      const norm = normalizeHeaderName(c);
+      if (normMap.has(norm)) return normMap.get(norm);
+      for (const [k, v] of normMap.entries()) if (k.includes(norm)) return v;
+    }
+    return null;
+  }
+
+  function parseTimeToSeconds(str) {
+    if (!str) return NaN;
+    const s = String(str).trim().replace(/,/g, ".");
+    const clean = s.replace(/[^0-9:\.]/g, "");
+    if (!clean) return NaN;
+    const parts = clean.split(":");
+    if (parts.length === 1) return parseFloat(parts[0]);
+    if (parts.length === 2) return parseInt(parts[0], 10) * 60 + parseFloat(parts[1]);
+    const h = parseInt(parts[0], 10) || 0, m = parseInt(parts[1], 10) || 0;
+    return h * 3600 + m * 60 + parseFloat(parts.slice(2).join(":"));
+  }
+
+  function normalizeGender(val) {
+    const s = String(val || "").toLowerCase();
+    if (!s) return "Okänt";
+    if (["dam", "kvinna", "f", "female", "flicka", "flickor"].some(x => s.includes(x))) return "Dam";
+    if (["herr", "man", "m", "male", "pojke", "pojkar"].some(x => s.includes(x))) return "Herr";
+    if (s === "k") return "Dam";
+    if (s === "h") return "Herr";
+    return "Okänt";
+  }
+
+  function onValidate() {
+    setErrors([]);
+    setValidated(false);
+    setSummary(null);
+
+    if (!rawText) {
+      setErrors(["Ingen fil inläst. Ladda upp en CSV först."]);
+      return;
+    }
+
+    const { headers: hdrs, rows } = findTableStartAndParse(rawText);
+    if (hdrs.length === 0 || rows.length === 0) {
+      setErrors(["Kunde inte hitta tabell i filen. Kontrollera att det är en Tempus-rapport."]);
+      setValidated(true);
+      return;
+    }
+
+    const nameCol   = pickColumn(hdrs, ["Simidrottare", "Namn"]);
+    const eventCol  = pickColumn(hdrs, ["Gren"]);
+    const timeCol   = pickColumn(hdrs, ["Tid"]);
+    const genderCol = pickColumn(hdrs, ["Kön", "Kon"]);
+
+    if (!nameCol || !eventCol || !timeCol) {
+      setErrors(["Saknar obligatoriska kolumner."]);
+      setValidated(true);
+      return;
+    }
+
+    const rowErrors = [];
+    const swimmersSet = new Set();
+    let dam = 0, herr = 0, okänt = 0;
+
+    rows.forEach((r, idx) => {
+      const name   = (r[nameCol]  || "").trim();
+      const gren   = (r[eventCol] || "").trim();
+      const tidRaw = (r[timeCol]  || "").trim();
+      const konRaw = genderCol ? (r[genderCol] || "").trim() : "";
+
+      if (!name && !gren && !tidRaw) return; // tom rad
+      if (!name)   rowErrors.push(`Rad ${idx + 2}: Tomt namn.`);
+      if (!gren)   rowErrors.push(`Rad ${idx + 2}: Tom gren.`);
+      if (!tidRaw) rowErrors.push(`Rad ${idx + 2}: Tom tid.`);
+
+      const sec = parseTimeToSeconds(tidRaw);
+      if (!isFinite(sec)) rowErrors.push(`Rad ${idx + 2}: Ogiltig tid "${tidRaw}".`);
+
+      if (name) {
+        swimmersSet.add(name);
+        const g = normalizeGender(konRaw);
+        if (g === "Dam") dam++;
+        else if (g === "Herr") herr++;
+        else okänt++;
+      }
+    });
+
+    setValidated(true);
+    if (rowErrors.length > 0) { setErrors(rowErrors); return; }
+
+    setSummary({
+      swimmers: swimmersSet.size,
+      dam,
+      herr,
+      okänt,
+    });
+  }
+
+  return (
+    <div style={{ maxWidth: 800, margin: "0 auto", padding: 16 }}>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Simvaliderare – Tempus CSV (minimal)</h1>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
+        <input ref={fileRef} type="file" accept=".csv" onChange={handleFile} />
+        <button onClick={onValidate} disabled={!rawText} style={btnStyle}>Validera fil</button>
+      </div>
+
+      {validated && (
+        <div style={{ marginTop: 8 }}>
+          {errors.length === 0 ? (
+            <div>
+              <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>OK</h2>
+              <ul>
+                <li>Simmare: {summary?.swimmers ?? 0}</li>
+                <li>Dam: {summary?.dam ?? 0}</li>
+                <li>Herr: {summary?.herr ?? 0}</li>
+                <li>Okänt: {summary?.okänt ?? 0}</li>
+              </ul>
+            </div>
+          ) : (
+            <div style={noteBox("#fff1f0", "#a8071a")}>
+              ❌ Fel
+              <ul>
+                {errors.slice(0, 25).map((e, i) => (<li key={i}>{e}</li>))}
+                {errors.length > 25 && <li>…och {errors.length - 25} fler fel</li>}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const btnStyle = {
+  border: "1px solid #ccc",
+  background: "#111",
+  color: "#fff",
+  padding: "8px 12px",
+  borderRadius: 8,
+  cursor: "pointer",
+};
+
+function noteBox(bg, color) {
+  return {
+    background: bg,
+    color,
+    border: `1px solid ${color}33`,
+    padding: 12,
+    borderRadius: 8,
+    marginTop: 8,
+  };
+}
+
