@@ -25,15 +25,22 @@ export default function App() {
   const [summary, setSummary] = useState(null);
 
   // UI-val
-  const [relayType, setRelayType] = useState("");       // 4x50 frisim, 4x100 frisim, ...
+  const [relayType, setRelayType] = useState("");       // 4x50 frisim, 4x100 frisim, 4x50 medley, ...
   const [relayClass, setRelayClass] = useState("");     // Herr | Dam | Mix
   const [selectedAges, setSelectedAges] = useState([]); // multi-select ages
   const [showSwimmersBox, setShowSwimmersBox] = useState(false);
   const [selectedSwimmers, setSelectedSwimmers] = useState(new Set());
 
-  // Nytt: antal lagkapper + strategi
-  const [relayTeams, setRelayTeams] = useState(1);           // 1..5
-  const [buildStrategy, setBuildStrategy] = useState("manual"); // 'manual' | 'fastest'
+  // Antal lag + strategi
+  const [relayTeams, setRelayTeams] = useState(1);              // 1..5
+  const [buildStrategy, setBuildStrategy] = useState("manual"); // 'manual' | 'fastest' | 'even'
+
+  // Genererade lag
+  const [generated, setGenerated] = useState(null);
+
+  // Statusrad för validering
+  const [valStatus, setValStatus] = useState({ state: "idle", message: "" });
+  // state: "idle" | "validating" | "success" | "error"
 
   // Default-filnamn (visning)
   const [defaultFileName, setDefaultFileName] = useState("");
@@ -45,6 +52,19 @@ export default function App() {
       setRawText(defaultCsvText);
       const parts = (defaultCsvPath || "").split("/");
       setDefaultFileName(parts[parts.length - 1] || "");
+    }
+  }, []);
+
+  // Injicera enkel @keyframes för spinnaren (en gång)
+  useEffect(() => {
+    const id = "app-spin-keyframes";
+    if (!document.getElementById(id)) {
+      const style = document.createElement("style");
+      style.id = id;
+      style.innerHTML = `
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+      `.trim();
+      document.head.appendChild(style);
     }
   }, []);
 
@@ -123,6 +143,7 @@ export default function App() {
       .replace(/\s+/g," ").trim();
   }
 
+  // Stöd för 50 rygg/bröst/fjäril + frisim
   function normalizeEvent(e) {
     const s = normStr(e).replace(/meter|m\.|m /g, "m ").replace(/\s+/g, " ");
     const has50  = /(^|\s)50\s*m/.test(s)  || /\b50m\b/.test(s);
@@ -134,7 +155,12 @@ export default function App() {
     const isBreast = /bröst|brost|breast/.test(s);
     const isFly    = /fjäril|fjaril|butterfly/.test(s);
 
+    // 50-distans för alla medley-ben
     if (has50  && isFree)   return "frisim_50";
+    if (has50  && isBack)   return "rygg_50";
+    if (has50  && isBreast) return "brost_50";
+    if (has50  && isFly)    return "fjaril_50";
+
     if (has100 && isFree)   return "frisim_100";
     if (has200 && isFree)   return "frisim_200";
     if (has100 && isBack)   return "rygg_100";
@@ -179,71 +205,91 @@ export default function App() {
     setSummary(null);
     setShowSwimmersBox(false);
     setSelectedSwimmers(new Set());
+    setGenerated(null);
 
-    if (!rawText) { setErrors(["Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx."]); return; }
-
-    const { headers: hdrs, rows } = findTableStartAndParse(rawText);
-    setHeaders(hdrs); setRows(rows);
-
-    if (hdrs.length === 0 || rows.length === 0) {
-      setErrors(["Kunde inte hitta tabell i filen. Kontrollera att det är en Tempus-rapport."]);
+    if (!rawText) {
+      setValStatus({ state: "error", message: "Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx." });
+      setErrors(["Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx."]);
       return;
     }
 
-    const nameCol   = pickColumn(hdrs, ["Simidrottare","Namn","Simmare","Namn på simmare","Simmarens namn"]);
-    const eventCol  = pickColumn(hdrs, ["Gren","Simgren","Distans"]);
-    const timeCol   = pickColumn(hdrs, ["Tid","Resultat","Sluttid"]);
-    const genderCol = pickColumn(hdrs, ["Kön","Kon","Gender","K"]);
-    const ageCol    = pickColumn(hdrs, ["Ålder vid loppet","Alder vid loppet","Ålder idag","Alder idag","Ålder","Alder"]);
-    const bornCol   = pickColumn(hdrs, ["Född","Fodd","Födelseår","Fodelsear"]);
-    const dateCol   = pickColumn(hdrs, ["Datum","Tävlingsdatum","Tavlingsdatum"]);
+    try {
+      setValStatus({ state: "validating", message: "Validerar filen…" });
 
-    const missing = [];
-    if (!nameCol)  missing.push("Namn/Simidrottare");
-    if (!eventCol) missing.push("Gren");
-    if (!timeCol)  missing.push("Tid");
-    if (missing.length) { setErrors([`Saknar obligatoriska kolumner: ${missing.join(", ")}`]); return; }
+      const { headers: hdrs, rows } = findTableStartAndParse(rawText);
+      setHeaders(hdrs); setRows(rows);
 
-    // Bygg bästa tider per simmare + normaliserade nycklar
-    const best = {}; // name -> { gender, age, nbest: { key -> {sec,str} } }
-
-    rows.forEach((r) => {
-      const name = (r[nameCol]||"").trim();
-      const gren = (r[eventCol]||"").trim();
-      const tidRaw = (r[timeCol]||"").trim();
-      const konRaw = genderCol ? (r[genderCol]||"").trim() : "";
-
-      if (!name && !gren && !tidRaw) return; // tom rad
-      const sec = parseTimeToSeconds(tidRaw);
-
-      // ålder (direkt eller härledd)
-      let alder = ageCol ? Number(String(r[ageCol]).replace(/[^0-9]/g, "")) : NaN;
-      if (!isFinite(alder)) {
-        const by = bornCol ? Number(String(r[bornCol]).slice(0,4)) : NaN;
-        const dy = dateCol ? Number(String(r[dateCol]).slice(0,4)) : NaN;
-        if (isFinite(by) && isFinite(dy)) alder = dy - by;
+      if (hdrs.length === 0 || rows.length === 0) {
+        const msg = "Kunde inte hitta tabell i filen. Kontrollera att det är en Tempus-rapport.";
+        setErrors([msg]);
+        setValStatus({ state: "error", message: msg });
+        return;
       }
 
-      if (!best[name]) best[name] = { gender: konRaw || "", age: isFinite(alder)?alder:"", nbest: {} };
+      const nameCol   = pickColumn(hdrs, ["Simidrottare","Namn","Simmare","Namn på simmare","Simmarens namn"]);
+      const eventCol  = pickColumn(hdrs, ["Gren","Simgren","Distans"]);
+      const timeCol   = pickColumn(hdrs, ["Tid","Resultat","Sluttid"]);
+      const genderCol = pickColumn(hdrs, ["Kön","Kon","Gender","K"]);
+      const ageCol    = pickColumn(hdrs, ["Ålder vid loppet","Alder vid loppet","Ålder idag","Alder idag","Ålder","Alder"]);
+      const bornCol   = pickColumn(hdrs, ["Född","Fodd","Födelseår","Fodelsear"]);
+      const dateCol   = pickColumn(hdrs, ["Datum","Tävlingsdatum","Tavlingsdatum"]);
 
-      const nkey = normalizeEvent(gren);
-      if (name && nkey && isFinite(sec)) {
-        if (!best[name].nbest[nkey] || sec < best[name].nbest[nkey].timeSec) {
-          best[name].nbest[nkey] = { timeSec: sec, timeStr: secondsToTimeStr(sec) };
+      const missing = [];
+      if (!nameCol)  missing.push("Namn/Simidrottare");
+      if (!eventCol) missing.push("Gren");
+      if (!timeCol)  missing.push("Tid");
+      if (missing.length) {
+        const msg = `Saknar obligatoriska kolumner: ${missing.join(", ")}`;
+        setErrors([msg]);
+        setValStatus({ state: "error", message: msg });
+        return;
+      }
+
+      const best = {}; // name -> { gender, age, nbest: { key -> {timeSec,timeStr} } }
+
+      rows.forEach((r) => {
+        const name = (r[nameCol]||"").trim();
+        const gren = (r[eventCol]||"").trim();
+        const tidRaw = (r[timeCol]||"").trim();
+        const konRaw = genderCol ? (r[genderCol]||"").trim() : "";
+
+        if (!name && !gren && !tidRaw) return; // tom rad
+        const sec = parseTimeToSeconds(tidRaw);
+
+        // ålder (direkt eller härledd)
+        let alder = ageCol ? Number(String(r[ageCol]).replace(/[^0-9]/g, "")) : NaN;
+        if (!isFinite(alder)) {
+          const by = bornCol ? Number(String(r[bornCol]).slice(0,4)) : NaN;
+          const dy = dateCol ? Number(String(r[dateCol]).slice(0,4)) : NaN;
+          if (isFinite(by) && isFinite(dy)) alder = dy - by;
         }
-      }
-      if (!best[name].gender && konRaw) best[name].gender = konRaw;
-      if (!best[name].age && isFinite(alder)) best[name].age = alder;
-    });
 
-    // Summering
-    const genders = Object.values(best).map((b) => normalizeGender(b.gender));
-    const dam = genders.filter((g) => g === "Dam").length;
-    const herr = genders.filter((g) => g === "Herr").length;
+        if (!best[name]) best[name] = { gender: konRaw || "", age: isFinite(alder)?alder:"", nbest: {} };
 
-    setBestBySwimmer(best);
-    setValidated(true);
-    setSummary({ swimmers: Object.keys(best).length, dam, herr });
+        const nkey = normalizeEvent(gren);
+        if (name && nkey && isFinite(sec)) {
+          if (!best[name].nbest[nkey] || sec < best[name].nbest[nkey].timeSec) {
+            best[name].nbest[nkey] = { timeSec: sec, timeStr: secondsToTimeStr(sec) };
+          }
+        }
+        if (!best[name].gender && konRaw) best[name].gender = konRaw;
+        if (!best[name].age && isFinite(alder)) best[name].age = alder;
+      });
+
+      // Summering
+      const genders = Object.values(best).map((b) => normalizeGender(b.gender));
+      const dam = genders.filter((g) => g === "Dam").length;
+      const herr = genders.filter((g) => g === "Herr").length;
+
+      setBestBySwimmer(best);
+      setValidated(true);
+      const sumObj = { swimmers: Object.keys(best).length, dam, herr };
+      setSummary(sumObj);
+      setValStatus({ state: "success", message: `Validering klar – ${sumObj.swimmers} simmare (Dam ${sumObj.dam} / Herr ${sumObj.herr})` });
+    } catch (e) {
+      setValStatus({ state: "error", message: "Ett oväntat fel inträffade under valideringen. Se konsolen." });
+      console.error(e);
+    }
   }
 
   // Ålderslista (multi-select)
@@ -259,13 +305,13 @@ export default function App() {
     if (/4x50\s*frisim/.test(s))  return ["frisim_50"];
     if (/4x100\s*frisim/.test(s)) return ["frisim_100"];
     if (/4x200\s*frisim/.test(s)) return ["frisim_200"];
-    if (/4x50\s*medley/.test(s))  return ["rygg_100","brost_100","fjaril_100","frisim_100"]; // visar 100 som referens
+    if (/4x50\s*medley/.test(s))  return ["rygg_50","brost_50","fjaril_50","frisim_50"];
     if (/4x100\s*medley/.test(s)) return ["rygg_100","brost_100","fjaril_100","frisim_100"];
     return [];
   }
-  const reqKeys = requiredEventKeys(relayType);
+  const reqKeys = useMemo(() => requiredEventKeys(relayType), [relayType]);
 
-  // Filtrering + sortering beroende på strategi
+  // Filtrering + sortering i listan
   const filteredSwimmers = useMemo(() => {
     const list = Object.entries(bestBySwimmer).map(([name, data]) => ({ name, ...data }));
     const ages = new Set(selectedAges.map(Number));
@@ -279,34 +325,31 @@ export default function App() {
 
     if (buildStrategy === "fastest" && reqKeys.length > 0) {
       arr.sort((a, b) => {
-        // 1) flest relevanta tider först
         const aAvail = reqKeys.filter(k => a.nbest?.[k]?.timeSec != null).length;
         const bAvail = reqKeys.filter(k => b.nbest?.[k]?.timeSec != null).length;
         if (aAvail !== bAvail) return bAvail - aAvail;
-
-        // 2) snabbare total (summa) först
-        const big = Number.POSITIVE_INFINITY / Math.max(1, reqKeys.length); // stor straffvikt för saknad tid
+        const big = 1e9;
         const aSum = reqKeys.reduce((s, k) => s + (a.nbest?.[k]?.timeSec ?? big), 0);
         const bSum = reqKeys.reduce((s, k) => s + (b.nbest?.[k]?.timeSec ?? big), 0);
         if (aSum !== bSum) return aSum - bSum;
-
-        // 3) namn
         return a.name.localeCompare(b.name, "sv");
       });
     } else {
       arr.sort((a,b)=>a.name.localeCompare(b.name, "sv"));
     }
-
     return arr;
   }, [bestBySwimmer, relayClass, selectedAges, buildStrategy, reqKeys]);
 
   function labelForKey(k) {
     switch (k) {
-      case "frisim_50": return "50 frisim";
+      case "frisim_50":  return "50 frisim";
       case "frisim_100": return "100 frisim";
       case "frisim_200": return "200 frisim";
-      case "rygg_100": return "100 rygg";
-      case "brost_100": return "100 bröst";
+      case "rygg_50":    return "50 rygg";
+      case "rygg_100":   return "100 rygg";
+      case "brost_50":   return "50 bröst";
+      case "brost_100":  return "100 bröst";
+      case "fjaril_50":  return "50 fjäril";
       case "fjaril_100": return "100 fjäril";
       default: return k;
     }
@@ -320,15 +363,299 @@ export default function App() {
     });
   }
 
+  // ---- Laggenerering med MIX-regel ----
+  function generateTeams() {
+    if (!relayType) { setGenerated(null); return; }
+
+    // baslista (respektera manuellt urval om strategi = manual)
+    const pool = (buildStrategy === "manual" && selectedSwimmers.size > 0)
+      ? filteredSwimmers.filter(s => selectedSwimmers.has(s.name))
+      : filteredSwimmers.slice();
+
+    if (pool.length === 0) { setGenerated({ note: "Inga simmare i urvalet.", teams: [] }); return; }
+
+    const sum = (arr) => arr.reduce((a,b)=>a+b,0);
+    const toStr = (sec) => secondsToTimeStr(sec);
+
+    // MIX-regel aktiv?
+    const requireMix = relayClass === "Mix";
+    const genderOf = new Map(pool.map(p => [p.name, normalizeGender(p.gender)]));
+
+    // ==== FRISIM (en distans) ====
+    if (reqKeys.length === 1 && reqKeys[0].startsWith("frisim")) {
+      const key = reqKeys[0];
+      const withTime = pool
+        .filter(p => p.nbest?.[key]?.timeSec != null)
+        .map(p => ({ ...p, t: p.nbest[key].timeSec }));
+      if (withTime.length < 4) { setGenerated({ note: "Färre än 4 med giltig frisimtid.", teams: [] }); return; }
+
+      withTime.sort((a,b)=>a.t - b.t);
+
+      // MIX: alltid 2 damer + 2 herrar per lag, snabbaste möjliga kombinationer
+      if (requireMix) {
+        const females = withTime.filter(p => genderOf.get(p.name) === "Dam");
+        const males   = withTime.filter(p => genderOf.get(p.name) === "Herr");
+        let fi = 0, mi = 0;
+        const teams = [];
+        for (let t = 0; t < relayTeams; t++) {
+          const grp = [];
+          if (fi + 2 <= females.length) grp.push(...females.slice(fi, fi+2));
+          if (mi + 2 <= males.length)   grp.push(...males.slice(mi, mi+2));
+          if (grp.length === 4) {
+            fi += 2; mi += 2;
+            grp.sort((a,b)=>a.t - b.t);
+            const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: toStr(s.t), stroke: "Frisim" }));
+            teams.push({ name: `Lag ${t+1}`, legs, total: sum(grp.map(x=>x.t)) });
+          } else {
+            break;
+          }
+        }
+        setGenerated({
+          note: teams.length === 0 ? "Inte tillräckligt med både Dam och Herr (behöver 2+2 per lag)." : null,
+          teams
+        });
+        return;
+      }
+
+      // Icke-mix: tidigare logik
+      let chunks = [];
+      if (buildStrategy === "fastest" || buildStrategy === "manual") {
+        for (let i=0; i<relayTeams; i++) {
+          const grp = withTime.slice(i*4, i*4+4);
+          if (grp.length === 4) chunks.push(grp);
+        }
+      } else if (buildStrategy === "even") {
+        const Ts = Array.from({length: relayTeams}, ()=>[]);
+        let forward = true, i = 0;
+        for (const s of withTime) {
+          if (Ts[i].length < 4) Ts[i].push(s);
+          if (forward) { i++; if (i >= relayTeams) { i = relayTeams - 1; forward = false; } }
+          else { i--; if (i < 0) { i = 0; forward = true; } }
+          if (Ts[i]?.length === 4) {
+            const next = Ts.findIndex(t => t.length < 4);
+            if (next !== -1) i = next;
+          }
+        }
+        chunks = Ts.filter(t => t.length === 4);
+      }
+
+      const teams = chunks.map((grp, idx) => {
+        const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: toStr(s.t), stroke: "Frisim" }));
+        return { name: `Lag ${idx+1}`, legs, total: sum(grp.map(x=>x.t)) };
+      });
+      setGenerated({ note: null, teams });
+      return;
+    }
+
+    // ==== MEDLEY (4 ben) ====
+    if (reqKeys.length === 4) {
+      const is50Medley = /4x50\s*medley/i.test(normStr(relayType));
+      const order = is50Medley
+        ? ["rygg_50","brost_50","fjaril_50","frisim_50"]
+        : ["rygg_100","brost_100","fjaril_100","frisim_100"];
+      const legLabel = (k) => labelForKey(k);
+
+      // Hjälpare: kontrollera att ett val håller 2+2 möjligt
+      function mixOkAfterPick(currentLegs, candName) {
+        if (!requireMix) return true;
+        const g = genderOf.get(candName);
+        const dam = currentLegs.filter(L => genderOf.get(L.name) === "Dam").length + (g === "Dam" ? 1 : 0);
+        const herr = currentLegs.filter(L => genderOf.get(L.name) === "Herr").length + (g === "Herr" ? 1 : 0);
+        if (dam > 2 || herr > 2) return false;
+        const legsLeft = 4 - (currentLegs.length + 1);
+        const needDam = 2 - dam, needHerr = 2 - herr;
+        return needDam >= 0 && needHerr >= 0 && (needDam + needHerr) <= legsLeft;
+      }
+
+      // === FASTEST: toppning med mix-constraint ===
+      if (buildStrategy === "fastest") {
+        const byLeg = {};
+        for (const leg of order) {
+          byLeg[leg] = pool
+            .filter(s => s.nbest?.[leg]?.timeSec != null)
+            .map(s => ({
+              name: s.name,
+              time: s.nbest[leg].timeSec,
+              timeStr: secondsToTimeStr(s.nbest[leg].timeSec)
+            }))
+            .sort((a,b)=>a.time - b.time);
+        }
+
+        const teams = [];
+        const globallyUsed = new Set();
+
+        for (let t = 0; t < relayTeams; t++) {
+          const usedInTeam = new Set();
+          const legs = [];
+
+          for (const leg of order) {
+            const list = byLeg[leg];
+            const pickIdx = list.findIndex(c =>
+              !usedInTeam.has(c.name) &&
+              !globallyUsed.has(c.name) &&
+              mixOkAfterPick(legs, c.name)
+            );
+            if (pickIdx !== -1) {
+              const pick = list[pickIdx];
+              legs.push({ leg: legLabel(leg), name: pick.name, time: pick.time, timeStr: pick.timeStr });
+              usedInTeam.add(pick.name);
+              globallyUsed.add(pick.name);
+            } else {
+              legs.push({ leg: legLabel(leg), name: "(saknas)", time: NaN, timeStr: "" });
+            }
+          }
+
+          const total = legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0);
+          const complete = legs.every(l => isFinite(l.time));
+          const dam = legs.filter(L => genderOf.get(L.name) === "Dam").length;
+          const herr = legs.filter(L => genderOf.get(L.name) === "Herr").length;
+
+          if (complete && (!requireMix || (dam === 2 && herr === 2))) {
+            teams.push({ name: `Lag ${t+1}`, legs, total });
+          } else {
+            break;
+          }
+        }
+
+        setGenerated({
+          note: teams.length === 0 && requireMix ? "Inte tillräckligt med mix-kandidater (behöver 2 Dam + 2 Herr per lag och tider på alla ben)." : null,
+          teams
+        });
+        return;
+      }
+
+      // === EVEN / MANUAL: snake + balancing med mix-constraint ===
+      const teams = Array.from({length: relayTeams}, (_,i)=>({ name:`Lag ${i+1}`, legs: [], total:0 }));
+      const teamUsed = Array.from({length: relayTeams}, ()=> new Set());
+      const usedGlobal = new Set();
+
+      for (let li = 0; li < order.length; li++) {
+        const legKey = order[li];
+
+        let cand = pool
+          .filter(s => s.nbest?.[legKey]?.timeSec != null && !usedGlobal.has(s.name))
+          .map(s => ({
+            name: s.name,
+            time: s.nbest[legKey].timeSec,
+            timeStr: secondsToTimeStr(s.nbest[legKey].timeSec)
+          }))
+          .sort((a,b)=>a.time - b.time);
+
+        const idxs = [...Array(relayTeams).keys()];
+        if (li % 2 === 1) idxs.reverse();
+
+        for (const ti of idxs) {
+          const pickIdx = cand.findIndex(c =>
+            !teamUsed[ti].has(c.name) &&
+            mixOkAfterPick(teams[ti].legs, c.name)
+          );
+          if (pickIdx !== -1) {
+            const pick = cand.splice(pickIdx,1)[0];
+            teams[ti].legs.push({ leg: legLabel(legKey), name: pick.name, time: pick.time, timeStr: pick.timeStr });
+            teamUsed[ti].add(pick.name);
+            usedGlobal.add(pick.name);
+          } else {
+            teams[ti].legs.push({ leg: legLabel(legKey), name: "(saknas)", time: NaN, timeStr: "" });
+          }
+        }
+      }
+
+      teams.forEach(t => { t.total = t.legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0); });
+
+      // ------- Balans (same-leg swaps), behåller 2+2 -------
+      const spread = (ts) => {
+        const totals = ts.map(t=>t.total);
+        return Math.max(...totals) - Math.min(...totals);
+      };
+      const maxIter = 50;
+      let improved = true, iter = 0;
+
+      while (improved && iter < maxIter) {
+        improved = false; iter++;
+        let bestSwap = null;
+        const curSpread = spread(teams);
+
+        for (let legIdx = 0; legIdx < 4; legIdx++) {
+          for (let i = 0; i < teams.length; i++) {
+            for (let j = i+1; j < teams.length; j++) {
+              const A = teams[i], B = teams[j];
+              const L1 = A.legs[legIdx], L2 = B.legs[legIdx];
+              if (!isFinite(L1.time) || !isFinite(L2.time)) continue;
+
+              // Behåll 2+2 efter swap
+              if (requireMix) {
+                const g1 = genderOf.get(L1.name), g2 = genderOf.get(L2.name);
+                const cnt = (legs) => ({
+                  dam: legs.filter(x=>genderOf.get(x.name)==="Dam").length,
+                  herr: legs.filter(x=>genderOf.get(x.name)==="Herr").length
+                });
+                const cA = cnt(A.legs), cB = cnt(B.legs);
+                const newA_dam  = cA.dam  - (g1==="Dam")  + (g2==="Dam");
+                const newA_herr = cA.herr - (g1==="Herr") + (g2==="Herr");
+                const newB_dam  = cB.dam  - (g2==="Dam")  + (g1==="Dam");
+                const newB_herr = cB.herr - (g2==="Herr") + (g1==="Herr");
+                if (newA_dam>2 || newA_herr>2 || newB_dam>2 || newB_herr>2) continue;
+              }
+
+              const aNames = new Set(A.legs.map(x=>x.name)); aNames.delete(L1.name);
+              const bNames = new Set(B.legs.map(x=>x.name)); bNames.delete(L2.name);
+              if (aNames.has(L2.name) || bNames.has(L1.name)) continue;
+
+              const newA = A.total - L1.time + L2.time;
+              const newB = B.total - L2.time + L1.time;
+
+              const maxOthers = teams.reduce((m,t,k)=> k===i||k===j ? m : Math.max(m, t.total), -Infinity);
+              const minOthers = teams.reduce((m,t,k)=> k===i||k===j ? m : Math.min(m, t.total), Infinity);
+              const newMax = Math.max(maxOthers, newA, newB);
+              const newMin = Math.min(minOthers, newA, newB);
+              const newSpread = newMax - newMin;
+
+              if (newSpread + 1e-9 < (bestSwap?.spread ?? curSpread)) {
+                bestSwap = { i, j, legIdx, newA, newB, spread: newSpread };
+              }
+            }
+          }
+        }
+
+        if (bestSwap) {
+          const A = teams[bestSwap.i], B = teams[bestSwap.j];
+          const tmp = A.legs[bestSwap.legIdx];
+          A.legs[bestSwap.legIdx] = B.legs[bestSwap.legIdx];
+          B.legs[bestSwap.legIdx] = tmp;
+          A.total = bestSwap.newA; B.total = bestSwap.newB;
+          improved = true;
+        }
+      }
+      // ------- /balans -------
+
+      // filtrera bort icke-kompletta eller icke-mix
+      const finalTeams = teams.filter(t => {
+        const complete = t.legs.every(L => isFinite(L.time));
+        if (!requireMix) return complete;
+        const dam = t.legs.filter(L => genderOf.get(L.name) === "Dam").length;
+        const herr = t.legs.filter(L => genderOf.get(L.name) === "Herr").length;
+        return complete && dam === 2 && herr === 2;
+      });
+
+      setGenerated({
+        note: requireMix && finalTeams.length < relayTeams ? "Vissa lag kunde inte göras till mix (kräver 2 Dam + 2 Herr med tider på alla ben)." : null,
+        teams: finalTeams
+      });
+      return;
+    }
+
+    setGenerated({ note: "Okänd eller ej stödd lagkappstyp.", teams: [] });
+  }
+
   // ---- UI ----
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Simvaliderare – Tempus CSV (lagkapp)</h1>
       <p style={{ marginBottom: 12 }}>
-        1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass & ålder och visa simmare.
+        1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass & ålder och visa/generera lag.
       </p>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
         <input
           ref={fileRef}
           type="file"
@@ -340,6 +667,8 @@ export default function App() {
             reader.onload = (ev) => {
               setRawText(String(ev.target?.result || ""));
               setDefaultFileName(f.name);
+              setErrors([]); setValidated(false); setGenerated(null);
+              setValStatus({ state: "idle", message: "" });
             };
             reader.readAsText(f, "utf-8");
           }}
@@ -352,138 +681,214 @@ export default function App() {
         )}
       </div>
 
+      {/* Statusrad */}
+      <div style={{ width: "100%", marginBottom: 12 }}>
+        {valStatus.state !== "idle" && (
+          <div
+            style={{
+              padding: "8px 10px",
+              borderRadius: 8,
+              fontSize: 13,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+              background:
+                valStatus.state === "success" ? "#f6ffed" :
+                valStatus.state === "error"   ? "#fff1f0" : "#f5f5f5",
+              color:
+                valStatus.state === "success" ? "#135200" :
+                valStatus.state === "error"   ? "#a8071a" : "#333",
+              border:
+                valStatus.state === "success" ? "1px solid #b7eb8f" :
+                valStatus.state === "error"   ? "1px solid #ffa39e" : "1px solid #d9d9d9",
+            }}
+          >
+            {valStatus.state === "validating" && (
+              <span
+                style={{
+                  width: 14, height: 14, border: "2px solid #999",
+                  borderTopColor: "transparent", borderRadius: "50%",
+                  display: "inline-block", animation: "spin 1s linear infinite"
+                }}
+              />
+            )}
+            <span>{valStatus.message}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Visa fel även om validated=false */}
+      {errors.length > 0 && (
+        <div style={noteBox("#fff1f0", "#a8071a")}>
+          ❌ Fel
+          <ul style={{ marginTop: 6 }}>
+            {errors.slice(0, 25).map((e, i) => (<li key={i}>{e}</li>))}
+            {errors.length > 25 && <li>…och {errors.length - 25} fler fel</li>}
+          </ul>
+        </div>
+      )}
+
       {validated && (
         <div style={{ marginTop: 8 }}>
-          {errors.length === 0 ? (
-            <div>
-              <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>OK</h2>
-              <ul style={{ marginBottom: 12 }}>
-                <li>Simmare: {summary?.swimmers ?? 0}</li>
-                <li>Dam: {summary?.dam ?? 0}</li>
-                <li>Herr: {summary?.herr ?? 0}</li>
-              </ul>
+          <div>
 
-              {/* Val för lagkapp / klass / ålder */}
-              <div style={cardBox}>
-                <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 2fr", gap: 12 }}>
-                  <div>
-                    <label className="block" style={labelStyle}>Lagkapp</label>
-                    <select value={relayType} onChange={(e)=>setRelayType(e.target.value)} style={selectStyle}>
-                      <option value="">Välj typ…</option>
-                      {["4x50 frisim","4x100 frisim","4x200 frisim","4x50 medley","4x100 medley"]
-                        .map((t)=> <option key={t} value={t}>{t}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block" style={labelStyle}>Klass</label>
-                    <select value={relayClass} onChange={(e)=>setRelayClass(e.target.value)} style={selectStyle}>
-                      <option value="">Välj klass…</option>
-                      {["Herr","Dam","Mix"].map((c)=> <option key={c} value={c}>{c}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block" style={labelStyle}>Åldersklasser (multi)</label>
-                    <select
-                      multiple
-                      value={selectedAges.map(String)}
-                      onChange={(e)=>{
-                        const vals = Array.from(e.target.selectedOptions).map(o=>Number(o.value));
-                        setSelectedAges(vals);
-                      }}
-                      style={{...selectStyle, height: 96}}
-                    >
-                      {availableAges.map((a)=> <option key={a} value={a}>{a} år</option>)}
-                    </select>
-                  </div>
+            {/* Val för lagkapp / klass / ålder */}
+            <div style={cardBox}>
+              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 2fr", gap: 12 }}>
+                <div>
+                  <label className="block" style={labelStyle}>Lagkapp</label>
+                  <select value={relayType} onChange={(e)=>{ setRelayType(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    <option value="">Välj typ…</option>
+                    {["4x50 frisim","4x100 frisim","4x200 frisim","4x50 medley","4x100 medley"]
+                      .map((t)=> <option key={t} value={t}>{t}</option>)}
+                  </select>
                 </div>
-
-                {/* Ny rad: antal lagkapper + strategi */}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginTop: 12 }}>
-                  <div>
-                    <label className="block" style={labelStyle}>Antal lagkapper</label>
-                    <select value={relayTeams} onChange={(e)=>setRelayTeams(Number(e.target.value))} style={selectStyle}>
-                      {[1,2,3,4,5].map(n=> <option key={n} value={n}>{n}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block" style={labelStyle}>Strategi</label>
-                    <select value={buildStrategy} onChange={(e)=>setBuildStrategy(e.target.value)} style={selectStyle}>
-                      <option value="manual">Manuellt urval</option>
-                      <option value="fastest">Snabbaste laget</option>
-                    </select>
-                  </div>
+                <div>
+                  <label className="block" style={labelStyle}>Klass</label>
+                  <select value={relayClass} onChange={(e)=>{ setRelayClass(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    <option value="">Välj klass…</option>
+                    {["Herr","Dam","Mix"].map((c)=> <option key={c} value={c}>{c}</option>)}
+                  </select>
                 </div>
-
-                <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <button
-                    style={btnStyle}
-                    onClick={() => setShowSwimmersBox(true)}
-                    disabled={!relayType}
-                    title={!relayType ? "Välj lagkapp" : "Visa filtrerade simmare"}
+                <div>
+                  <label className="block" style={labelStyle}>Åldersklasser (multi)</label>
+                  <select
+                    multiple
+                    value={selectedAges.map(String)}
+                    onChange={(e)=>{
+                      const vals = Array.from(e.target.selectedOptions).map(o=>Number(o.value));
+                      setSelectedAges(vals); setGenerated(null);
+                    }}
+                    style={{...selectStyle, height: 96}}
                   >
-                    Visa alla simmare
-                  </button>
-                  {reqKeys.length > 0 && (
-                    <span style={{ fontSize: 12, opacity: 0.8 }}>
-                      Visar kolumner: {reqKeys.map(labelForKey).join(', ')} • Antal lagkapper: {relayTeams} • Strategi: {buildStrategy === 'fastest' ? 'Snabbaste laget' : 'Manuellt'}
-                    </span>
-                  )}
+                    {availableAges.map((a)=> <option key={a} value={a}>{a} år</option>)}
+                  </select>
                 </div>
               </div>
 
-              {showSwimmersBox && (
-                <div style={{ ...cardBox, marginTop: 12 }}>
-                  <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Simmare</h3>
+              {/* Antal lagkapper + strategi */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginTop: 12 }}>
+                <div>
+                  <label className="block" style={labelStyle}>Antal lagkapper</label>
+                  <select value={relayTeams} onChange={(e)=>{ setRelayTeams(Number(e.target.value)); setGenerated(null); }} style={selectStyle}>
+                    {[1,2,3,4,5].map(n=> <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block" style={labelStyle}>Strategi</label>
+                  <select value={buildStrategy} onChange={(e)=>{ setBuildStrategy(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    <option value="manual">Manuellt urval</option>
+                    <option value="fastest">Snabbaste laget</option>
+                    <option value="even">Jämna lag</option>
+                  </select>
+                </div>
+              </div>
 
-                  <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
-                    <table className="min-w-full border-collapse">
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <button
+                  style={btnStyle}
+                  onClick={() => setShowSwimmersBox(true)}
+                  disabled={!relayType}
+                  title={!relayType ? "Välj lagkapp" : "Visa filtrerade simmare"}
+                >
+                  Visa alla simmare
+                </button>
+
+                <button
+                  style={btnStyle}
+                  onClick={generateTeams}
+                  disabled={!relayType}
+                  title="Generera lagkapper enligt vald strategi"
+                >
+                  Generera lag
+                </button>
+
+                {reqKeys.length > 0 && (
+                  <span style={{ fontSize: 12, opacity: 0.8 }}>
+                    Visar kolumner: {reqKeys.map(labelForKey).join(', ')} • Antal lagkapper: {relayTeams} • Strategi: {{
+                      fastest: 'Snabbaste laget', manual: 'Manuellt', even: 'Jämna lag'
+                    }[buildStrategy]}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {showSwimmersBox && (
+              <div style={{ ...cardBox, marginTop: 12 }}>
+                <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Simmare</h3>
+
+                <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
+                  <table className="min-w-full border-collapse">
+                    <thead>
+                      <tr>
+                        <th className="border px-2 py-1 text-left">Välj</th>
+                        <th className="border px-2 py-1 text-left">Namn</th>
+                        <th className="border px-2 py-1 text-left">Kön</th>
+                        <th className="border px-2 py-1 text-left">Ålder</th>
+                        {reqKeys.map((k)=> (
+                          <th key={k} className="border px-2 py-1 text-left">{labelForKey(k)}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredSwimmers.map(({ name, gender, age, nbest }) => {
+                        const g = normalizeGender(gender);
+                        return (
+                          <tr key={name}>
+                            <td className="border px-2 py-1">
+                              <input type="checkbox" checked={selectedSwimmers.has(name)} onChange={()=>toggleSelect(name)} />
+                            </td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
+                            {reqKeys.map((k)=> (
+                              <td key={k} className="border px-2 py-1 whitespace-nowrap">{nbest?.[k]?.timeStr || ""}</td>
+                            ))}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+                  Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
+                </div>
+              </div>
+            )}
+
+            {generated && (
+              <div style={{ ...cardBox, marginTop: 12 }}>
+                <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Föreslagna lag</h3>
+                {generated.note && <div style={noteBox("#fffbe6","#ad6800")}>⚠ {generated.note}</div>}
+                {generated.teams.length > 0 ? generated.teams.map((team, idx) => (
+                  <div key={idx} style={{ marginBottom: 12 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 6 }}>
+                      {team.name} — Total: {secondsToTimeStr(team.total)}
+                    </div>
+                    <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6 }}>
                       <thead>
                         <tr>
-                          <th className="border px-2 py-1 text-left">Välj</th>
-                          <th className="border px-2 py-1 text-left">Namn</th>
-                          <th className="border px-2 py-1 text-left">Kön</th>
-                          <th className="border px-2 py-1 text-left">Ålder</th>
-                          {reqKeys.map((k)=> (
-                            <th key={k} className="border px-2 py-1 text-left">{labelForKey(k)}</th>
-                          ))}
+                          <th className="border px-2 py-1 text-left">Sträcka</th>
+                          <th className="border px-2 py-1 text-left">Simmare</th>
+                          <th className="border px-2 py-1 text-left">Tid</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {filteredSwimmers.map(({ name, gender, age, nbest }) => {
-                          const g = normalizeGender(gender);
-                          return (
-                            <tr key={name}>
-                              <td className="border px-2 py-1">
-                                <input type="checkbox" checked={selectedSwimmers.has(name)} onChange={()=>toggleSelect(name)} />
-                              </td>
-                              <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
-                              <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
-                              <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
-                              {reqKeys.map((k)=> (
-                                <td key={k} className="border px-2 py-1 whitespace-nowrap">{nbest?.[k]?.timeStr || ""}</td>
-                              ))}
-                            </tr>
-                          );
-                        })}
+                        {team.legs.map((L, i) => (
+                          <tr key={i}>
+                            <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
+                          </tr>
+                        ))}
                       </tbody>
                     </table>
                   </div>
-
-                  <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
-                    Valda simmare: {selectedSwimmers.size}
-                  </div>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div style={noteBox("#fff1f0", "#a8071a")}>
-              ❌ Fel
-              <ul>
-                {errors.slice(0, 25).map((e, i) => (<li key={i}>{e}</li>))}
-                {errors.length > 25 && <li>…och {errors.length - 25} fler fel</li>}
-              </ul>
-            </div>
-          )}
+                )) : <div style={{ fontSize: 14, opacity: 0.8 }}>Inga kompletta lag kunde genereras.</div>}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
