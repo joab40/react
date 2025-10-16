@@ -1,58 +1,63 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, useEffect } from "react";
 
-/**
- * React/Vite – Simvaliderare + Lagkappväljare för Tempus "Statistikrapport Individuell" (.csv)
- *
- * Steg:
- * 1) Ladda upp & Validera
- * 2) Välj lagkapp, klass och åldersklasser (multi-select)
- * 3) Klicka "Visa alla simmare" → lista med relevanta tider och möjlighet att välja simmare
+/** Förladdning av default-CSV (Vite 5/6-kompatibel):
+ * Letar upp första .csv-filen i samma katalog som App.jsx och läser in dess råtext.
  */
+const allCsvFiles = import.meta.glob("./*.csv", { query: "?raw", import: "default", eager: true });
+let defaultCsvPath = null;
+let defaultCsvText = null;
+for (const path of Object.keys(allCsvFiles)) {
+  if (path.toLowerCase().endsWith(".csv")) {
+    defaultCsvPath = path;
+    defaultCsvText = allCsvFiles[path];
+    break;
+  }
+}
 
 export default function App() {
+  // Data / validering
   const [rawText, setRawText] = useState("");
   const [rows, setRows] = useState([]);
   const [headers, setHeaders] = useState([]);
   const [errors, setErrors] = useState([]);
-  const [warnings, setWarnings] = useState([]);
   const [validated, setValidated] = useState(false);
   const [bestBySwimmer, setBestBySwimmer] = useState({});
   const [summary, setSummary] = useState(null);
 
   // UI-val
-  const [relayType, setRelayType] = useState(""); // 4x50 frisim, 4x100 frisim, 4x200 frisim, 4x50 medley, 4x100 medley
-  const [relayClass, setRelayClass] = useState(""); // Herr | Dam | Mix
+  const [relayType, setRelayType] = useState("");       // 4x50 frisim, 4x100 frisim, ...
+  const [relayClass, setRelayClass] = useState("");     // Herr | Dam | Mix
   const [selectedAges, setSelectedAges] = useState([]); // multi-select ages
   const [showSwimmersBox, setShowSwimmersBox] = useState(false);
   const [selectedSwimmers, setSelectedSwimmers] = useState(new Set());
 
+  // Nytt: antal lagkapper + strategi
+  const [relayTeams, setRelayTeams] = useState(1);           // 1..5
+  const [buildStrategy, setBuildStrategy] = useState("manual"); // 'manual' | 'fastest'
+
+  // Default-filnamn (visning)
+  const [defaultFileName, setDefaultFileName] = useState("");
   const fileRef = useRef(null);
 
-  function handleFile(e) {
-    const f = e.target.files?.[0];
-    resetState();
-    if (!f) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => setRawText(String(ev.target?.result || ""));
-    reader.readAsText(f, "utf-8");
-  }
+  // Läs in första .csv i katalogen – utan att validera automatiskt
+  useEffect(() => {
+    if (defaultCsvText) {
+      setRawText(defaultCsvText);
+      const parts = (defaultCsvPath || "").split("/");
+      setDefaultFileName(parts[parts.length - 1] || "");
+    }
+  }, []);
 
-  function resetState() {
-    setRows([]); setHeaders([]); setErrors([]); setWarnings([]);
-    setValidated(false); setBestBySwimmer({}); setSummary(null);
-    setRelayType(""); setRelayClass(""); setSelectedAges([]);
-    setShowSwimmersBox(false); setSelectedSwimmers(new Set());
-  }
-
+  // ---- CSV/parse helpers ----
   function detectDelimiter(sample) {
     const sc = (sample.match(/;/g) || []).length;
     const cc = (sample.match(/,/g) || []).length;
     return sc >= cc ? ";" : ",";
   }
 
-  // CSV-split med citatstöd
   function smartSplit(line, delimiter) {
-    const cols = []; let cur = ""; let inQuotes = false;
+    const cols = [];
+    let cur = "", inQuotes = false;
     for (let i = 0; i < line.length; i++) {
       const ch = line[i];
       if (ch === '"') { inQuotes = !inQuotes; continue; }
@@ -63,7 +68,6 @@ export default function App() {
     return cols.map((s) => s.replace(/^"|"$/g, "").trim());
   }
 
-  // Hitta tabellhuvud (hoppa över preamble) och parsa
   function findTableStartAndParse(text) {
     const delimiter = detectDelimiter(text.slice(0, 2000));
     const lines = text.replace(/\r\n?/g, "\n").split("\n");
@@ -82,7 +86,7 @@ export default function App() {
     const body = allLines.slice(1)
       .map((ln) => smartSplit(ln, delimiter))
       .filter((cols) => cols.some((c) => (c || "").trim().length > 0))
-      // Filtrera bort insprängda rubrikrader i body
+      // filtrera bort insprängda rubrikrader i body
       .filter((cols) => {
         let headerHits = 0; for (const c of cols) if (headerSet.has((c || "").trim())) headerHits++;
         return headerHits < 3 && (cols[0] || "").trim() !== "Placering";
@@ -112,7 +116,7 @@ export default function App() {
     return null;
   }
 
-  // Normalisering av event → nycklar
+  // Normalisering av gren till nycklar vi kan slå upp
   function normStr(s) {
     return String(s||"").toLowerCase()
       .replaceAll("å","a").replaceAll("ä","a").replaceAll("ö","o")
@@ -120,27 +124,23 @@ export default function App() {
   }
 
   function normalizeEvent(e) {
-    const s = normStr(e)
-      .replace(/meter|m\.|m /g, "m ")
-      .replace(/\s+/g, " ");
-    // distans
-    const has50 = /(^|\s)50\s*m/.test(s) || /\b50m\b/.test(s);
+    const s = normStr(e).replace(/meter|m\.|m /g, "m ").replace(/\s+/g, " ");
+    const has50  = /(^|\s)50\s*m/.test(s)  || /\b50m\b/.test(s);
     const has100 = /(^|\s)100\s*m/.test(s) || /\b100m\b/.test(s);
     const has200 = /(^|\s)200\s*m/.test(s) || /\b200m\b/.test(s);
 
-    // simsätt
-    const isFree = /frisim|freestyle/.test(s);
-    const isBack = /rygg|ryggsim|backstroke/.test(s);
+    const isFree   = /frisim|freestyle/.test(s);
+    const isBack   = /rygg|ryggsim|backstroke/.test(s);
     const isBreast = /bröst|brost|breast/.test(s);
-    const isFly = /fjäril|fjaril|butterfly/.test(s);
+    const isFly    = /fjäril|fjaril|butterfly/.test(s);
 
-    if (has50 && isFree) return "frisim_50";
-    if (has100 && isFree) return "frisim_100";
-    if (has200 && isFree) return "frisim_200";
-    if (has100 && isBack) return "rygg_100";
+    if (has50  && isFree)   return "frisim_50";
+    if (has100 && isFree)   return "frisim_100";
+    if (has200 && isFree)   return "frisim_200";
+    if (has100 && isBack)   return "rygg_100";
     if (has100 && isBreast) return "brost_100";
-    if (has100 && isFly) return "fjaril_100";
-    return null; // annat ignoreras för listkolumnerna
+    if (has100 && isFly)    return "fjaril_100";
+    return null;
   }
 
   function parseTimeToSeconds(str) {
@@ -171,19 +171,25 @@ export default function App() {
     return "";
   }
 
+  // ---- Validering ----
   function onValidate() {
-    setErrors([]); setWarnings([]); setValidated(false);
-    setBestBySwimmer({}); setSummary(null);
-    setShowSwimmersBox(false); setSelectedSwimmers(new Set());
+    setErrors([]);
+    setValidated(false);
+    setBestBySwimmer({});
+    setSummary(null);
+    setShowSwimmersBox(false);
+    setSelectedSwimmers(new Set());
 
-    if (!rawText) { setErrors(["Ingen fil inläst. Ladda upp en CSV först."]); return; }
+    if (!rawText) { setErrors(["Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx."]); return; }
 
     const { headers: hdrs, rows } = findTableStartAndParse(rawText);
     setHeaders(hdrs); setRows(rows);
 
-    if (hdrs.length === 0 || rows.length === 0) { setErrors(["Kunde inte hitta tabell i filen."]); return; }
+    if (hdrs.length === 0 || rows.length === 0) {
+      setErrors(["Kunde inte hitta tabell i filen. Kontrollera att det är en Tempus-rapport."]);
+      return;
+    }
 
-    // Kolumner
     const nameCol   = pickColumn(hdrs, ["Simidrottare","Namn","Simmare","Namn på simmare","Simmarens namn"]);
     const eventCol  = pickColumn(hdrs, ["Gren","Simgren","Distans"]);
     const timeCol   = pickColumn(hdrs, ["Tid","Resultat","Sluttid"]);
@@ -198,8 +204,8 @@ export default function App() {
     if (!timeCol)  missing.push("Tid");
     if (missing.length) { setErrors([`Saknar obligatoriska kolumner: ${missing.join(", ")}`]); return; }
 
-    // Bygg bästa tider + lagra kön/ålder och normaliserade nycklar
-    const best = {}; // name -> { gender, age, best:{label->{sec,str}}, nbest:{key->{sec,str}} }
+    // Bygg bästa tider per simmare + normaliserade nycklar
+    const best = {}; // name -> { gender, age, nbest: { key -> {sec,str} } }
 
     rows.forEach((r) => {
       const name = (r[nameCol]||"").trim();
@@ -209,6 +215,8 @@ export default function App() {
 
       if (!name && !gren && !tidRaw) return; // tom rad
       const sec = parseTimeToSeconds(tidRaw);
+
+      // ålder (direkt eller härledd)
       let alder = ageCol ? Number(String(r[ageCol]).replace(/[^0-9]/g, "")) : NaN;
       if (!isFinite(alder)) {
         const by = bornCol ? Number(String(r[bornCol]).slice(0,4)) : NaN;
@@ -216,23 +224,19 @@ export default function App() {
         if (isFinite(by) && isFinite(dy)) alder = dy - by;
       }
 
-      if (!best[name]) best[name] = { gender: konRaw || "", age: isFinite(alder)?alder:"", best: {}, nbest: {} };
+      if (!best[name]) best[name] = { gender: konRaw || "", age: isFinite(alder)?alder:"", nbest: {} };
 
       const nkey = normalizeEvent(gren);
-      if (name && gren && isFinite(sec)) {
-        if (!best[name].best[gren] || sec < best[name].best[gren].timeSec) {
-          best[name].best[gren] = { timeSec: sec, timeStr: secondsToTimeStr(sec) };
+      if (name && nkey && isFinite(sec)) {
+        if (!best[name].nbest[nkey] || sec < best[name].nbest[nkey].timeSec) {
+          best[name].nbest[nkey] = { timeSec: sec, timeStr: secondsToTimeStr(sec) };
         }
-        if (nkey) {
-          if (!best[name].nbest[nkey] || sec < best[name].nbest[nkey].timeSec) {
-            best[name].nbest[nkey] = { timeSec: sec, timeStr: secondsToTimeStr(sec) };
-          }
-        }
-        if (!best[name].gender && konRaw) best[name].gender = konRaw;
-        if (!best[name].age && isFinite(alder)) best[name].age = alder;
       }
+      if (!best[name].gender && konRaw) best[name].gender = konRaw;
+      if (!best[name].age && isFinite(alder)) best[name].age = alder;
     });
 
+    // Summering
     const genders = Object.values(best).map((b) => normalizeGender(b.gender));
     const dam = genders.filter((g) => g === "Dam").length;
     const herr = genders.filter((g) => g === "Herr").length;
@@ -242,24 +246,12 @@ export default function App() {
     setSummary({ swimmers: Object.keys(best).length, dam, herr });
   }
 
-  // Ålderslista till multi-select
+  // Ålderslista (multi-select)
   const availableAges = useMemo(() => {
     const s = new Set();
     Object.values(bestBySwimmer).forEach((b) => { if (b.age !== "" && Number.isFinite(b.age)) s.add(b.age); });
     return Array.from(s).sort((a,b)=>a-b);
   }, [bestBySwimmer]);
-
-  // Filtrering på klass och ålder
-  const filteredSwimmers = useMemo(() => {
-    const list = Object.entries(bestBySwimmer).map(([name, data]) => ({ name, ...data }));
-    const ages = new Set(selectedAges.map(Number));
-    return list.filter(({ gender, age }) => {
-      const g = normalizeGender(gender);
-      const passClass = !relayClass || relayClass === "Mix" || g === relayClass;
-      const passAge = ages.size === 0 || (Number.isFinite(age) && ages.has(age));
-      return passClass && passAge;
-    }).sort((a,b)=>a.name.localeCompare(b.name, "sv"));
-  }, [bestBySwimmer, relayClass, selectedAges]);
 
   // Vilka tider ska visas beroende på lagkapp
   function requiredEventKeys(rt) {
@@ -272,6 +264,41 @@ export default function App() {
     return [];
   }
   const reqKeys = requiredEventKeys(relayType);
+
+  // Filtrering + sortering beroende på strategi
+  const filteredSwimmers = useMemo(() => {
+    const list = Object.entries(bestBySwimmer).map(([name, data]) => ({ name, ...data }));
+    const ages = new Set(selectedAges.map(Number));
+
+    let arr = list.filter(({ gender, age }) => {
+      const g = normalizeGender(gender);
+      const passClass = !relayClass || relayClass === "Mix" || g === relayClass;
+      const passAge = ages.size === 0 || (Number.isFinite(age) && ages.has(age));
+      return passClass && passAge;
+    });
+
+    if (buildStrategy === "fastest" && reqKeys.length > 0) {
+      arr.sort((a, b) => {
+        // 1) flest relevanta tider först
+        const aAvail = reqKeys.filter(k => a.nbest?.[k]?.timeSec != null).length;
+        const bAvail = reqKeys.filter(k => b.nbest?.[k]?.timeSec != null).length;
+        if (aAvail !== bAvail) return bAvail - aAvail;
+
+        // 2) snabbare total (summa) först
+        const big = Number.POSITIVE_INFINITY / Math.max(1, reqKeys.length); // stor straffvikt för saknad tid
+        const aSum = reqKeys.reduce((s, k) => s + (a.nbest?.[k]?.timeSec ?? big), 0);
+        const bSum = reqKeys.reduce((s, k) => s + (b.nbest?.[k]?.timeSec ?? big), 0);
+        if (aSum !== bSum) return aSum - bSum;
+
+        // 3) namn
+        return a.name.localeCompare(b.name, "sv");
+      });
+    } else {
+      arr.sort((a,b)=>a.name.localeCompare(b.name, "sv"));
+    }
+
+    return arr;
+  }, [bestBySwimmer, relayClass, selectedAges, buildStrategy, reqKeys]);
 
   function labelForKey(k) {
     switch (k) {
@@ -293,16 +320,36 @@ export default function App() {
     });
   }
 
+  // ---- UI ----
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Simvaliderare – Tempus CSV (lagkapp)</h1>
       <p style={{ marginBottom: 12 }}>
-        1) Ladda upp och <strong>Validera fil</strong>. 2) Välj lagkapp, klass & ålder. 3) Klicka <em>Visa alla simmare</em>.
+        1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass & ålder och visa simmare.
       </p>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
-        <input ref={fileRef} type="file" accept=".csv" onChange={handleFile} />
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".csv"
+          onChange={(e)=>{
+            const f = e.target.files?.[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+              setRawText(String(ev.target?.result || ""));
+              setDefaultFileName(f.name);
+            };
+            reader.readAsText(f, "utf-8");
+          }}
+        />
         <button onClick={onValidate} disabled={!rawText} style={btnStyle}>Validera fil</button>
+        {defaultFileName && (
+          <span style={{ fontSize: 12, opacity: 0.8 }}>
+            Förvald fil: <strong>{defaultFileName}</strong>
+          </span>
+        )}
       </div>
 
       {validated && (
@@ -316,7 +363,7 @@ export default function App() {
                 <li>Herr: {summary?.herr ?? 0}</li>
               </ul>
 
-              {/* Val för lagkapp/klass/ålder */}
+              {/* Val för lagkapp / klass / ålder */}
               <div style={cardBox}>
                 <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 2fr", gap: 12 }}>
                   <div>
@@ -335,7 +382,7 @@ export default function App() {
                     </select>
                   </div>
                   <div>
-                    <label className="block" style={labelStyle}>Åldersklasser (håll Ctrl/Cmd för fler)</label>
+                    <label className="block" style={labelStyle}>Åldersklasser (multi)</label>
                     <select
                       multiple
                       value={selectedAges.map(String)}
@@ -346,6 +393,23 @@ export default function App() {
                       style={{...selectStyle, height: 96}}
                     >
                       {availableAges.map((a)=> <option key={a} value={a}>{a} år</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Ny rad: antal lagkapper + strategi */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginTop: 12 }}>
+                  <div>
+                    <label className="block" style={labelStyle}>Antal lagkapper</label>
+                    <select value={relayTeams} onChange={(e)=>setRelayTeams(Number(e.target.value))} style={selectStyle}>
+                      {[1,2,3,4,5].map(n=> <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block" style={labelStyle}>Strategi</label>
+                    <select value={buildStrategy} onChange={(e)=>setBuildStrategy(e.target.value)} style={selectStyle}>
+                      <option value="manual">Manuellt urval</option>
+                      <option value="fastest">Snabbaste laget</option>
                     </select>
                   </div>
                 </div>
@@ -361,7 +425,7 @@ export default function App() {
                   </button>
                   {reqKeys.length > 0 && (
                     <span style={{ fontSize: 12, opacity: 0.8 }}>
-                      Visar kolumner: {reqKeys.map(labelForKey).join(', ')}
+                      Visar kolumner: {reqKeys.map(labelForKey).join(', ')} • Antal lagkapper: {relayTeams} • Strategi: {buildStrategy === 'fastest' ? 'Snabbaste laget' : 'Manuellt'}
                     </span>
                   )}
                 </div>
@@ -436,8 +500,8 @@ const btnStyle = {
 };
 
 const selectStyle = { border: "1px solid #ccc", padding: 8, borderRadius: 8, width: "100%" };
-const labelStyle = { fontSize: 12, opacity: 0.8, marginBottom: 4 };
-const cardBox = { border: "1px solid #eee", borderRadius: 12, padding: 12, background: "#fafafa" };
+const labelStyle  = { fontSize: 12, opacity: 0.8, marginBottom: 4 };
+const cardBox     = { border: "1px solid #eee", borderRadius: 12, padding: 12, background: "#fafafa" };
 
 function noteBox(bg, color) {
   return { background: bg, color, border: `1px solid ${color}33`, padding: 12, borderRadius: 8, marginTop: 8 };
