@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState, useEffect } from "react";
-import sssLogo from "./assets/sss_logga_no_year.png";
+import sssLogoLight from "./assets/sss_logga_no_year.png";
+import sssLogoDark from "./assets/sss_logga_no_year_dark.png";
 
 /** Förladdning av default-CSV (Vite 5/6-kompatibel):
  * Letar upp första .csv-filen i samma katalog som App.jsx och läser in dess råtext.
@@ -29,6 +30,7 @@ export default function App() {
   const [relayType, setRelayType] = useState("");       // 4x50 frisim, 4x100 frisim, 4x200 frisim, 4x50 medley, ...
   const [relayClass, setRelayClass] = useState("");     // Herr | Dam | Mix
   const [selectedAges, setSelectedAges] = useState([]); // multi-select ages
+  const [selectedClub, setSelectedClub] = useState(""); // föreningsfilter
   const [showSwimmersBox, setShowSwimmersBox] = useState(false);
   const [selectedSwimmers, setSelectedSwimmers] = useState(new Set());
 
@@ -49,6 +51,25 @@ export default function App() {
 
   // Inline-edit state
   const [editing, setEditing] = useState(null); // { name, key, value } | null
+
+  // Dark mode – håll koll på systemets tema och uppdatera dynamiskt
+  const [isDark, setIsDark] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false
+  );
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e) => setIsDark(e.matches);
+    if (mql.addEventListener) mql.addEventListener("change", handler);
+    else mql.addListener?.(handler);
+    return () => {
+      if (mql.removeEventListener) mql.removeEventListener("change", handler);
+      else mql.removeListener?.(handler);
+    };
+  }, []);
+  const sssLogo = isDark ? sssLogoDark : sssLogoLight;
 
   // Läs in första .csv i katalogen – utan att validera automatiskt
   useEffect(() => {
@@ -75,7 +96,7 @@ export default function App() {
   // ---- CSV/parse helpers ----
   function detectDelimiter(sample) {
     const sc = (sample.match(/;/g) || []).length;
-    const cc = (sample.match(/,/g) || []).length;
+       const cc = (sample.match(/,/g) || []).length;
     return sc >= cc ? ";" : ",";
   }
 
@@ -211,6 +232,7 @@ export default function App() {
     setSelectedSwimmers(new Set());
     setGenerated(null);
     setEditing(null);
+    setSelectedClub("");
 
     if (!rawText) {
       setValStatus({ state: "error", message: "Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx." });
@@ -238,6 +260,7 @@ export default function App() {
       const ageCol    = pickColumn(hdrs, ["Ålder vid loppet","Alder vid loppet","Ålder idag","Alder idag","Ålder","Alder"]);
       const bornCol   = pickColumn(hdrs, ["Född","Fodd","Födelseår","Fodelsear"]);
       const dateCol   = pickColumn(hdrs, ["Datum","Tävlingsdatum","Tavlingsdatum"]);
+      const clubCol   = pickColumn(hdrs, ["Förening","Forening","Klubb","Förening/Klubb","Club","Team"]);
 
       const missing = [];
       if (!nameCol)  missing.push("Namn/Simidrottare");
@@ -250,26 +273,32 @@ export default function App() {
         return;
       }
 
-      const best = {}; // name -> { gender, age, nbest: { key -> {timeSec,timeStr,manual?} } }
+      const CURRENT_YEAR = new Date().getFullYear(); // t.ex. 2025
+      const best = {}; // name -> { gender, age, club, nbest: { key -> {timeSec,timeStr,manual?} } }
 
       rows.forEach((r) => {
         const name = (r[nameCol]||"").trim();
         const gren = (r[eventCol]||"").trim();
         const tidRaw = (r[timeCol]||"").trim();
         const konRaw = genderCol ? (r[genderCol]||"").trim() : "";
+        const clubRaw = clubCol ? (r[clubCol] || "").trim() : "";
 
         if (!name && !gren && !tidRaw) return; // tom rad
         const sec = parseTimeToSeconds(tidRaw);
 
-        // ålder (direkt eller härledd)
+        // Ålder enligt "ålder under innevarande år" (t.ex. 2010 -> 15 år under 2025)
         let alder = ageCol ? Number(String(r[ageCol]).replace(/[^0-9]/g, "")) : NaN;
-        if (!isFinite(alder)) {
-          const by = bornCol ? Number(String(r[bornCol]).slice(0,4)) : NaN;
-          const dy = dateCol ? Number(String(r[dateCol]).slice(0,4)) : NaN;
-          if (isFinite(by) && isFinite(dy)) alder = dy - by;
+        const bornYear = bornCol ? Number(String(r[bornCol]).slice(0,4)) : NaN;
+        const dateYear = dateCol ? Number(String(r[dateCol]).slice(0,4)) : NaN;
+
+        if (isFinite(bornYear)) {
+          alder = CURRENT_YEAR - bornYear;
+        } else if (!isFinite(alder) && isFinite(dateYear)) {
+          // fallback om bara datum finns – mindre viktigt i praktiken
+          alder = dateYear - (isFinite(bornYear) ? bornYear : dateYear);
         }
 
-        if (!best[name]) best[name] = { gender: konRaw || "", age: isFinite(alder)?alder:"", nbest: {} };
+        if (!best[name]) best[name] = { gender: konRaw || "", age: isFinite(alder)?alder:"", club: clubRaw || "", nbest: {} };
 
         const nkey = normalizeEvent(gren);
         if (name && nkey && isFinite(sec)) {
@@ -279,6 +308,7 @@ export default function App() {
         }
         if (!best[name].gender && konRaw) best[name].gender = konRaw;
         if (!best[name].age && isFinite(alder)) best[name].age = alder;
+        if (!best[name].club && clubRaw) best[name].club = clubRaw;
       });
 
       // Summering
@@ -304,6 +334,16 @@ export default function App() {
     return Array.from(s).sort((a,b)=>a-b);
   }, [bestBySwimmer]);
 
+  // Föreningslista
+  const availableClubs = useMemo(() => {
+    const s = new Set();
+    Object.values(bestBySwimmer).forEach((b) => {
+      const c = (b.club || "").trim();
+      if (c) s.add(c);
+    });
+    return Array.from(s).sort((a,b)=>a.localeCompare(b,"sv"));
+  }, [bestBySwimmer]);
+
   // Vilka tider ska visas beroende på lagkapp
   function requiredEventKeys(rt) {
     const s = normStr(rt);
@@ -321,11 +361,12 @@ export default function App() {
     const list = Object.entries(bestBySwimmer).map(([name, data]) => ({ name, ...data }));
     const ages = new Set(selectedAges.map(Number));
 
-    let arr = list.filter(({ gender, age }) => {
+    let arr = list.filter(({ gender, age, club }) => {
       const g = normalizeGender(gender);
       const passClass = !relayClass || relayClass === "Mix" || g === relayClass;
       const passAge = ages.size === 0 || (Number.isFinite(age) && ages.has(age));
-      return passClass && passAge;
+      const passClub = !selectedClub || (club || "").trim() === selectedClub;
+      return passClass && passAge && passClub;
     });
 
     if (buildStrategy === "fastest" && reqKeys.length > 0) {
@@ -343,7 +384,7 @@ export default function App() {
       arr.sort((a,b)=>a.name.localeCompare(b.name, "sv"));
     }
     return arr;
-  }, [bestBySwimmer, relayClass, selectedAges, buildStrategy, reqKeys]);
+  }, [bestBySwimmer, relayClass, selectedAges, selectedClub, buildStrategy, reqKeys]);
 
   // Auto-bocka alla när rutan visas eller listan uppdateras
   useEffect(() => {
@@ -400,7 +441,7 @@ export default function App() {
     if (!isFinite(sec)) return false;
     setBestBySwimmer(prev => {
       const copy = { ...prev };
-      const s = copy[swimmerName] || { gender: "", age: "", nbest: {} };
+      const s = copy[swimmerName] || { gender: "", age: "", club: "", nbest: {} };
       const nbest = { ...(s.nbest || {}) };
       nbest[key] = { timeSec: sec, timeStr: secondsToTimeStr(sec), manual: true };
       copy[swimmerName] = { ...s, nbest };
@@ -603,9 +644,9 @@ export default function App() {
               const L1 = A.legs[legIdx], L2 = B.legs[legIdx];
               if (!isFinite(L1.time) || !isFinite(L2.time)) continue;
 
+              const g1 = normalizeGender(bestBySwimmer[L1.name]?.gender);
+              const g2 = normalizeGender(bestBySwimmer[L2.name]?.gender);
               if (requireMix) {
-                const g1 = normalizeGender(bestBySwimmer[L1.name]?.gender);
-                const g2 = normalizeGender(bestBySwimmer[L2.name]?.gender);
                 const cnt = (legs) => ({
                   dam: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Dam").length,
                   herr: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Herr").length
@@ -694,7 +735,7 @@ export default function App() {
       </div>
 
       <p style={{ marginBottom: 12 }}>
-        1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass & ålder och visa/generera lag.
+        1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass, förening & ålder och visa/generera lag.
       </p>
 
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
@@ -770,13 +811,12 @@ export default function App() {
         </div>
       )}
 
-      {validated && (
-        <div style={{ marginTop: 8 }}>
-          <div>
-
-            {/* Val för lagkapp / klass / ålder */}
-            <div style={cardBox}>
-              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 2fr", gap: 12 }}>
+      {/* ===== Kontrollpanel alltid synlig – låst tills validerad ===== */}
+      <div style={{ marginTop: 8 }}>
+        <div>
+          <div style={cardBox}>
+            <fieldset disabled={!validated} style={{ border: 0, padding: 0, margin: 0, display: "block" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 2fr 2fr", gap: 12 }}>
                 <div>
                   <label className="block" style={labelStyle}>Lagkapp</label>
                   <select value={relayType} onChange={(e)=>{ setRelayType(e.target.value); setGenerated(null); }} style={selectStyle}>
@@ -790,6 +830,17 @@ export default function App() {
                   <select value={relayClass} onChange={(e)=>{ setRelayClass(e.target.value); setGenerated(null); }} style={selectStyle}>
                     <option value="">Välj klass…</option>
                     {["Herr","Dam","Mix"].map((c)=> <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block" style={labelStyle}>Förening</label>
+                  <select
+                    value={selectedClub}
+                    onChange={(e)=>{ setSelectedClub(e.target.value); setGenerated(null); }}
+                    style={selectStyle}
+                  >
+                    <option value="">Alla föreningar</option>
+                    {availableClubs.map((c)=> <option key={c} value={c}>{c}</option>)}
                   </select>
                 </div>
                 <div>
@@ -851,161 +902,174 @@ export default function App() {
 
                 {reqKeys.length > 0 && (
                   <span style={{ fontSize: 12, opacity: 0.8 }}>
-                    Visar kolumner: {reqKeys.map(labelForKey).join(', ')} • Antal lagkapper: {relayTeams} • Strategi: {{
+                    Visar: {reqKeys.map(labelForKey).join(', ')} • Förening: {selectedClub || "Alla"} • Lag: {relayTeams} • Strategi: {{
                       fastest: 'Snabbaste laget', manual: 'Manuellt', even: 'Jämna lag'
                     }[buildStrategy]}
                   </span>
                 )}
               </div>
-            </div>
+            </fieldset>
+          </div>
 
-            {showSwimmersBox && (
-              <div style={{ ...cardBox, marginTop: 12 }}>
-                <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
-                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-                  Alla simmare förvalda – klicka bort de som inte deltar. <br/>
-                  <strong>Tips:</strong> Klicka på en tid eller “(saknas)” för att <em>redigera</em>. Enter = spara, Esc = avbryt, lämna tomt = ta bort.
-                </div>
-
-                {/* Knappar: markera/avmarkera alla */}
-                <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-                  <button style={btnStyle} onClick={selectAllVisible} title="Markera alla synliga">Markera alla</button>
-                  <button style={btnSubtle} onClick={clearAllSelected} title="Avmarkera alla">Avmarkera alla</button>
-                </div>
-
-                <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
-                  <table className="min-w-full border-collapse">
-                    <thead>
-                      <tr>
-                        <th className="border px-2 py-1 text-left">Välj</th>
-                        <th className="border px-2 py-1 text-left">Namn</th>
-                        <th className="border px-2 py-1 text-left">Kön</th>
-                        <th className="border px-2 py-1 text-left">Ålder</th>
-                        {reqKeys.map((k)=> (
-                          <th key={k} className="border px-2 py-1 text-left">{labelForKey(k)}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredSwimmers.map(({ name, gender, age, nbest }) => {
-                        const g = normalizeGender(gender);
-                        return (
-                          <tr key={name}>
-                            <td className="border px-2 py-1">
-                              <input type="checkbox" checked={selectedSwimmers.has(name)} onChange={()=>toggleSelect(name)} />
-                            </td>
-                            <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
-                            <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
-                            <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
-                            {reqKeys.map((k)=> {
-                              const cell = nbest?.[k];
-                              const isEditing = editing && editing.name === name && editing.key === k;
-                              const display = cell?.timeStr || "";
-                              const manual = !!cell?.manual;
-
-                              return (
-                                <td key={k} className="border px-2 py-1 whitespace-nowrap">
-                                  {isEditing ? (
-                                    <input
-                                      autoFocus
-                                      type="text"
-                                      value={editing.value}
-                                      onChange={(e)=> setEditing(ed => ({ ...ed, value: e.target.value }))}
-                                      onBlur={() => {
-                                        const ok = updateTime(name, k, editing.value);
-                                        if (!ok) return; // låt användaren rätta ogiltigt värde
-                                        setEditing(null);
-                                      }}
-                                      onKeyDown={(e) => {
-                                        if (e.key === "Enter") {
-                                          const ok = updateTime(name, k, editing.value);
-                                          if (ok) setEditing(null);
-                                        } else if (e.key === "Escape") {
-                                          setEditing(null);
-                                        }
-                                      }}
-                                      placeholder="mm:ss.hh eller ss.hh"
-                                      style={{ border: "1px solid #bbb", borderRadius: 6, padding: "4px 6px", minWidth: 90 }}
-                                    />
-                                  ) : (
-                                    <span
-                                      onClick={() => setEditing({ name, key: k, value: display || "" })}
-                                      title="Klicka för att redigera"
-                                      style={{
-                                        cursor: "pointer",
-                                        fontStyle: manual ? "italic" : "normal",
-                                        color: manual ? "#1d39c4" : "inherit",
-                                      }}
-                                    >
-                                      {display || <span style={{ opacity: 0.5 }}>(saknas)</span>}
-                                      {manual && <span title="Manuellt satt tid"> *</span>}
-                                    </span>
-                                  )}
-                                </td>
-                              );
-                            })}
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
-                  Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
-                </div>
+          {/* Simmare-rutan */}
+          {showSwimmersBox && (
+            <div style={{ ...cardBox, marginTop: 12 }}>
+              <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
+              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
+                Alla simmare förvalda – klicka bort de som inte deltar. <br/>
+                <strong>Tips:</strong> Klicka på en tid eller “(saknas)” för att <em>redigera</em>. Enter = spara, Esc = avbryt, lämna tomt = ta bort.
               </div>
-            )}
 
-            {generated && (
+              {/* Knappar: markera/avmarkera alla */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                <button style={btnStyle} onClick={selectAllVisible} title="Markera alla synliga">Markera alla</button>
+                <button style={btnSubtle} onClick={clearAllSelected} title="Avmarkera alla">Avmarkera alla</button>
+              </div>
+
+              <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
+                <table className="min-w-full border-collapse">
+                  <thead>
+                    <tr>
+                      <th className="border px-2 py-1 text-left">Välj</th>
+                      <th className="border px-2 py-1 text-left">Namn</th>
+                      <th className="border px-2 py-1 text-left">Kön</th>
+                      <th className="border px-2 py-1 text-left">Ålder</th>
+                      <th className="border px-2 py-1 text-left">Förening</th>
+                      {reqKeys.map((k)=> (
+                        <th key={k} className="border px-2 py-1 text-left">{labelForKey(k)}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredSwimmers.map(({ name, gender, age, club, nbest }) => {
+                      const g = normalizeGender(gender);
+                      return (
+                        <tr key={name}>
+                          <td className="border px-2 py-1">
+                            <input type="checkbox" checked={selectedSwimmers.has(name)} onChange={()=>toggleSelect(name)} />
+                          </td>
+                          <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
+                          <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
+                          <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
+                          <td className="border px-2 py-1 whitespace-nowrap">{club || ""}</td>
+                          {reqKeys.map((k)=> {
+                            const cell = nbest?.[k];
+                            const isEditing = editing && editing.name === name && editing.key === k;
+                            const display = cell?.timeStr || "";
+                            const manual = !!cell?.manual;
+
+                            return (
+                              <td key={k} className="border px-2 py-1 whitespace-nowrap">
+                                {isEditing ? (
+                                  <input
+                                    autoFocus
+                                    type="text"
+                                    value={editing.value}
+                                    onChange={(e)=> setEditing(ed => ({ ...ed, value: e.target.value }))}
+                                    onBlur={() => {
+                                      const ok = updateTime(name, k, editing.value);
+                                      if (!ok) return;
+                                      setEditing(null);
+                                    }}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") {
+                                        const ok = updateTime(name, k, editing.value);
+                                        if (ok) setEditing(null);
+                                      } else if (e.key === "Escape") {
+                                        setEditing(null);
+                                      }
+                                    }}
+                                    placeholder="mm:ss.hh eller ss.hh"
+                                    style={{ border: "1px solid #bbb", borderRadius: 6, padding: "4px 6px", minWidth: 90 }}
+                                  />
+                                ) : (
+                                  <span
+                                    onClick={() => setEditing({ name, key: k, value: display || "" })}
+                                    title="Klicka för att redigera"
+                                    style={{
+                                      cursor: "pointer",
+                                      fontStyle: manual ? "italic" : "normal",
+                                      color: manual ? "#1d39c4" : "inherit",
+                                    }}
+                                  >
+                                    {display || <span style={{ opacity: 0.5 }}>(saknas)</span>}
+                                    {manual && <span title="Manuellt satt tid"> *</span>}
+                                  </span>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+                Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
+              </div>
+            </div>
+          )}
+
+          {/* Föreslagna lag – renderas när du klickat Generera lag */}
+          {generated && (
+            <div
+              style={{
+                ...cardBox,
+                marginTop: 12,
+                position: "relative",
+                overflow: "hidden",
+                backgroundImage: `url(${sssLogo})`,
+                backgroundRepeat: "no-repeat",
+                backgroundPosition: "center 30%",
+                backgroundSize: "min(35vw, 280px)",
+                backgroundBlendMode: "soft-light",
+                isolation: "isolate"
+              }}
+            >
               <div
                 style={{
-                  ...cardBox,
-                  marginTop: 12,
-                  position: "relative",
-                  overflow: "hidden",
-                  backgroundImage: `url(${sssLogo})`,
-                  backgroundRepeat: "no-repeat",
-                  backgroundPosition: "right -30px top -30px",
-                  backgroundSize: "220px",
-                  isolation: "isolate"
+                  position: "absolute",
+                  inset: 0,
+                  background: isDark ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.75)",
+                  zIndex: 0
                 }}
-              >
-                <div style={{ position: "absolute", inset: 0, background: "rgba(255,255,255,0.75)", zIndex: 0 }} />
-                <div style={{ position: "relative", zIndex: 1 }}>
-                  <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Föreslagna lag</h3>
-                  {generated.note && <div style={noteBox("#fffbe6","#ad6800")}>⚠ {generated.note}</div>}
-                  {generated.teams.length > 0 ? generated.teams.map((team, idx) => (
-                    <div key={idx} style={{ marginBottom: 12 }}>
-                      <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                        {team.name} — Total: {secondsToTimeStr(team.total)}
-                      </div>
-                      <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6, background: "#fff" }}>
-                        <thead>
-                          <tr>
-                            <th className="border px-2 py-1 text-left">Sträcka</th>
-                            <th className="border px-2 py-1 text-left">Simmare</th>
-                            <th className="border px-2 py-1 text-left">Tid</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {team.legs.map((L, i) => (
-                            <tr key={i}>
-                              <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
-                              <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
-                              <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+              />
+              <div style={{ position: "relative", zIndex: 1 }}>
+                <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Föreslagna lag</h3>
+                {generated.note && <div style={noteBox("#fffbe6","#ad6800")}>⚠ {generated.note}</div>}
+                {generated.teams.length > 0 ? generated.teams.map((team, idx) => (
+                  <div key={idx} style={{ marginBottom: 12 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 6 }}>
+                      {team.name} — Total: {secondsToTimeStr(team.total)}
                     </div>
-                  )) : <div style={{ fontSize: 14, opacity: 0.8 }}>Inga kompletta lag kunde genereras.</div>}
-                </div>
+                    <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6, background: "#fff" }}>
+                      <thead>
+                        <tr>
+                          <th className="border px-2 py-1 text-left">Sträcka</th>
+                          <th className="border px-2 py-1 text-left">Simmare</th>
+                          <th className="border px-2 py-1 text-left">Tid</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {team.legs.map((L, i) => (
+                          <tr key={i}>
+                            <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )) : <div style={{ fontSize: 14, opacity: 0.8 }}>Inga kompletta lag kunde genereras.</div>}
               </div>
-            )}
-          </div>
+            </div>
+          )}
+
         </div>
-      )}
+      </div>
     </div>
   );
 }
