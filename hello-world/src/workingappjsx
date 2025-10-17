@@ -370,6 +370,14 @@ export default function App() {
     });
   }
 
+  // 🔹 Nya hjälpare: markera alla / avmarkera alla
+  function selectAllVisible() {
+    setSelectedSwimmers(new Set(filteredSwimmers.map(s => s.name)));
+  }
+  function clearAllSelected() {
+    setSelectedSwimmers(new Set());
+  }
+
   // ---- Laggenerering med MIX-regel + bockningskrav ----
   function generateTeams() {
     if (!relayType) { setGenerated(null); return; }
@@ -829,6 +837,24 @@ export default function App() {
                 <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
                 <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
                   Alla simmare förvalda – klicka bort de som inte deltar.
+                </div>
+
+                {/* Nya knappar: markera/avmarkera alla */}
+                <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                  <button
+                    style={btnStyle}
+                    onClick={selectAllVisible}
+                    title="Markera alla simmare i den filtrerade listan"
+                  >
+                    Markera alla
+                  </button>
+                  <button
+                    style={{ ...btnStyle, background: "#666" }}
+                    onClick={clearAllSelected}
+                    title="Avmarkera alla simmare"
+                  >
+                    Avmarkera alla
+                  </button>
                 </div>
 
                 <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>

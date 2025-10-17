@@ -46,6 +46,10 @@ export default function App() {
   const [defaultFileName, setDefaultFileName] = useState("");
   const fileRef = useRef(null);
 
+  // 🔹 Inline-edit state (vilken cell som redigeras just nu)
+  //    { name, key, value } | null
+  const [editing, setEditing] = useState(null);
+
   // Läs in första .csv i katalogen – utan att validera automatiskt
   useEffect(() => {
     if (defaultCsvText) {
@@ -206,6 +210,7 @@ export default function App() {
     setShowSwimmersBox(false);
     setSelectedSwimmers(new Set());
     setGenerated(null);
+    setEditing(null);
 
     if (!rawText) {
       setValStatus({ state: "error", message: "Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx." });
@@ -245,7 +250,7 @@ export default function App() {
         return;
       }
 
-      const best = {}; // name -> { gender, age, nbest: { key -> {timeSec,timeStr} } }
+      const best = {}; // name -> { gender, age, nbest: { key -> {timeSec,timeStr,manual?} } }
 
       rows.forEach((r) => {
         const name = (r[nameCol]||"").trim();
@@ -378,11 +383,45 @@ export default function App() {
     setSelectedSwimmers(new Set());
   }
 
+  // 🔹 Uppdatera/ta bort tid för en simmare på en viss sträcka (key)
+  function updateTime(swimmerName, key, newTimeStr) {
+    const trimmed = String(newTimeStr ?? "").trim();
+
+    // Tomt => ta bort tiden
+    if (!trimmed) {
+      setBestBySwimmer(prev => {
+        const copy = { ...prev };
+        const s = copy[swimmerName];
+        if (!s) return prev;
+        const nbest = { ...(s.nbest || {}) };
+        if (nbest[key]) {
+          delete nbest[key];
+          copy[swimmerName] = { ...s, nbest };
+        }
+        return copy;
+      });
+      return true;
+    }
+
+    const sec = parseTimeToSeconds(trimmed);
+    if (!isFinite(sec)) return false;
+
+    setBestBySwimmer(prev => {
+      const copy = { ...prev };
+      const s = copy[swimmerName] || { gender: "", age: "", nbest: {} };
+      const nbest = { ...(s.nbest || {}) };
+      nbest[key] = { timeSec: sec, timeStr: secondsToTimeStr(sec), manual: true };
+      copy[swimmerName] = { ...s, nbest };
+      return copy;
+    });
+    return true;
+  }
+
   // ---- Laggenerering med MIX-regel + bockningskrav ----
   function generateTeams() {
     if (!relayType) { setGenerated(null); return; }
 
-    // 🔹 Använd alltid endast bockade om några finns, annars alla filtrerade
+    // Använd alltid endast bockade om några finns, annars alla filtrerade
     const pool = (selectedSwimmers.size > 0)
       ? filteredSwimmers.filter(s => selectedSwimmers.has(s.name))
       : filteredSwimmers.slice();
@@ -665,7 +704,7 @@ export default function App() {
   // ---- UI ----
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Simvaliderare – Tempus CSV (lagkapp)</h1>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Lagkapp Generator för Simtävling</h1>
       <p style={{ marginBottom: 12 }}>
         1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass & ålder och visa/generera lag.
       </p>
@@ -836,7 +875,8 @@ export default function App() {
               <div style={{ ...cardBox, marginTop: 12 }}>
                 <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
                 <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-                  Alla simmare förvalda – klicka bort de som inte deltar.
+                  Alla simmare förvalda – klicka bort de som inte deltar. <br/>
+                  <strong>Tips:</strong> Klicka på en tid eller “(saknas)” för att <em>redigera</em>. Enter = spara, Esc = avbryt, lämna tomt = ta bort.
                 </div>
 
                 {/* Nya knappar: markera/avmarkera alla */}
@@ -881,9 +921,62 @@ export default function App() {
                             <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
                             <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
                             <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
-                            {reqKeys.map((k)=> (
-                              <td key={k} className="border px-2 py-1 whitespace-nowrap">{nbest?.[k]?.timeStr || ""}</td>
-                            ))}
+                            {reqKeys.map((k)=> {
+                              const cell = nbest?.[k];
+                              const isEditing = editing && editing.name === name && editing.key === k;
+                              const display = cell?.timeStr || "";
+                              const manual = !!cell?.manual;
+
+                              return (
+                                <td key={k} className="border px-2 py-1 whitespace-nowrap">
+                                  {isEditing ? (
+                                    <input
+                                      autoFocus
+                                      type="text"
+                                      value={editing.value}
+                                      onChange={(e)=> setEditing(ed => ({ ...ed, value: e.target.value }))}
+                                      onBlur={() => {
+                                        const ok = updateTime(name, k, editing.value);
+                                        if (!ok) {
+                                          // Låt fältet vara kvar vid ogiltig input (användaren kan rätta)
+                                          return;
+                                        }
+                                        setEditing(null);
+                                      }}
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter") {
+                                          const ok = updateTime(name, k, editing.value);
+                                          if (ok) setEditing(null);
+                                        } else if (e.key === "Escape") {
+                                          setEditing(null);
+                                        }
+                                      }}
+                                      placeholder="mm:ss.hh eller ss.hh"
+                                      style={{ border: "1px solid #bbb", borderRadius: 6, padding: "4px 6px", minWidth: 90 }}
+                                    />
+                                  ) : (
+                                    <span
+                                      onClick={() => {
+                                        setEditing({
+                                          name,
+                                          key: k,
+                                          value: display || ""
+                                        });
+                                      }}
+                                      title="Klicka för att redigera"
+                                      style={{
+                                        cursor: "pointer",
+                                        fontStyle: manual ? "italic" : "normal",
+                                        color: manual ? "#1d39c4" : "inherit",
+                                      }}
+                                    >
+                                      {display || <span style={{ opacity: 0.5 }}>(saknas)</span>}
+                                      {manual && <span title="Manuellt satt tid"> *</span>}
+                                    </span>
+                                  )}
+                                </td>
+                              );
+                            })}
                           </tr>
                         );
                       })}
@@ -892,7 +985,7 @@ export default function App() {
                 </div>
 
                 <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
-                  Valda simmare: {selectedSwimmers.size}
+                  Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
                 </div>
               </div>
             )}
