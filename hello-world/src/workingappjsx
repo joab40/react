@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState, useEffect } from "react";
+import sssLogo from "./assets/sss_logga_no_year.png";
 
 /** Förladdning av default-CSV (Vite 5/6-kompatibel):
  * Letar upp första .csv-filen i samma katalog som App.jsx och läser in dess råtext.
@@ -45,6 +46,9 @@ export default function App() {
   // Default-filnamn (visning)
   const [defaultFileName, setDefaultFileName] = useState("");
   const fileRef = useRef(null);
+
+  // Inline-edit state
+  const [editing, setEditing] = useState(null); // { name, key, value } | null
 
   // Läs in första .csv i katalogen – utan att validera automatiskt
   useEffect(() => {
@@ -206,6 +210,7 @@ export default function App() {
     setShowSwimmersBox(false);
     setSelectedSwimmers(new Set());
     setGenerated(null);
+    setEditing(null);
 
     if (!rawText) {
       setValStatus({ state: "error", message: "Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx." });
@@ -245,7 +250,7 @@ export default function App() {
         return;
       }
 
-      const best = {}; // name -> { gender, age, nbest: { key -> {timeSec,timeStr} } }
+      const best = {}; // name -> { gender, age, nbest: { key -> {timeSec,timeStr,manual?} } }
 
       rows.forEach((r) => {
         const name = (r[nameCol]||"").trim();
@@ -340,7 +345,7 @@ export default function App() {
     return arr;
   }, [bestBySwimmer, relayClass, selectedAges, buildStrategy, reqKeys]);
 
-  // 🔹 Auto-bocka alla när rutan visas eller listan uppdateras
+  // Auto-bocka alla när rutan visas eller listan uppdateras
   useEffect(() => {
     if (!showSwimmersBox) return;
     const all = new Set(filteredSwimmers.map(s => s.name));
@@ -370,19 +375,45 @@ export default function App() {
     });
   }
 
-  // 🔹 Nya hjälpare: markera alla / avmarkera alla
-  function selectAllVisible() {
-    setSelectedSwimmers(new Set(filteredSwimmers.map(s => s.name)));
-  }
-  function clearAllSelected() {
-    setSelectedSwimmers(new Set());
+  // Markera/avmarkera
+  function selectAllVisible() { setSelectedSwimmers(new Set(filteredSwimmers.map(s => s.name))); }
+  function clearAllSelected() { setSelectedSwimmers(new Set()); }
+
+  // Uppdatera/ta bort tid (inline)
+  function updateTime(swimmerName, key, newTimeStr) {
+    const trimmed = String(newTimeStr ?? "").trim();
+    if (!trimmed) {
+      setBestBySwimmer(prev => {
+        const copy = { ...prev };
+        const s = copy[swimmerName];
+        if (!s) return prev;
+        const nbest = { ...(s.nbest || {}) };
+        if (nbest[key]) {
+          delete nbest[key];
+          copy[swimmerName] = { ...s, nbest };
+        }
+        return copy;
+      });
+      return true;
+    }
+    const sec = parseTimeToSeconds(trimmed);
+    if (!isFinite(sec)) return false;
+    setBestBySwimmer(prev => {
+      const copy = { ...prev };
+      const s = copy[swimmerName] || { gender: "", age: "", nbest: {} };
+      const nbest = { ...(s.nbest || {}) };
+      nbest[key] = { timeSec: sec, timeStr: secondsToTimeStr(sec), manual: true };
+      copy[swimmerName] = { ...s, nbest };
+      return copy;
+    });
+    return true;
   }
 
   // ---- Laggenerering med MIX-regel + bockningskrav ----
   function generateTeams() {
     if (!relayType) { setGenerated(null); return; }
 
-    // 🔹 Använd alltid endast bockade om några finns, annars alla filtrerade
+    // Använd alltid endast bockade om några finns, annars alla filtrerade
     const pool = (selectedSwimmers.size > 0)
       ? filteredSwimmers.filter(s => selectedSwimmers.has(s.name))
       : filteredSwimmers.slice();
@@ -392,11 +423,10 @@ export default function App() {
     const sum = (arr) => arr.reduce((a,b)=>a+b,0);
     const toStr = (sec) => secondsToTimeStr(sec);
 
-    // MIX-regel aktiv?
     const requireMix = relayClass === "Mix";
     const genderOf = new Map(pool.map(p => [p.name, normalizeGender(p.gender)]));
 
-    // ==== FRISIM (en distans) ====
+    // FRISIM (en distans)
     if (reqKeys.length === 1 && reqKeys[0].startsWith("frisim")) {
       const key = reqKeys[0];
       const withTime = pool
@@ -406,7 +436,6 @@ export default function App() {
 
       withTime.sort((a,b)=>a.t - b.t);
 
-      // MIX: alltid 2 damer + 2 herrar per lag
       if (requireMix) {
         const females = withTime.filter(p => genderOf.get(p.name) === "Dam");
         const males   = withTime.filter(p => genderOf.get(p.name) === "Herr");
@@ -425,14 +454,11 @@ export default function App() {
             break;
           }
         }
-        setGenerated({
-          note: teams.length === 0 ? "Inte tillräckligt med både Dam och Herr (behöver 2+2 per lag)." : null,
-          teams
-        });
+        setGenerated({ note: teams.length === 0 ? "Inte tillräckligt med både Dam och Herr (behöver 2+2 per lag)." : null, teams });
         return;
       }
 
-      // Icke-mix: tidigare logik
+      // icke-mix
       let chunks = [];
       if (buildStrategy === "fastest" || buildStrategy === "manual") {
         for (let i=0; i<relayTeams; i++) {
@@ -462,7 +488,7 @@ export default function App() {
       return;
     }
 
-    // ==== MEDLEY (4 ben) ====
+    // MEDLEY (4 ben)
     if (reqKeys.length === 4) {
       const is50Medley = /4x50\s*medley/i.test(normStr(relayType));
       const order = is50Medley
@@ -470,7 +496,6 @@ export default function App() {
         : ["rygg_100","brost_100","fjaril_100","frisim_100"];
       const legLabel = (k) => labelForKey(k);
 
-      // Hjälpare: kontrollera att ett val håller 2+2 möjligt
       function mixOkAfterPick(currentLegs, candName) {
         if (!requireMix) return true;
         const g = genderOf.get(candName);
@@ -482,17 +507,12 @@ export default function App() {
         return needDam >= 0 && needHerr >= 0 && (needDam + needHerr) <= legsLeft;
       }
 
-      // === FASTEST: toppning med mix-constraint ===
       if (buildStrategy === "fastest") {
         const byLeg = {};
         for (const leg of order) {
           byLeg[leg] = pool
             .filter(s => s.nbest?.[leg]?.timeSec != null)
-            .map(s => ({
-              name: s.name,
-              time: s.nbest[leg].timeSec,
-              timeStr: secondsToTimeStr(s.nbest[leg].timeSec)
-            }))
+            .map(s => ({ name: s.name, time: s.nbest[leg].timeSec, timeStr: secondsToTimeStr(s.nbest[leg].timeSec) }))
             .sort((a,b)=>a.time - b.time);
         }
 
@@ -502,7 +522,6 @@ export default function App() {
         for (let t = 0; t < relayTeams; t++) {
           const usedInTeam = new Set();
           const legs = [];
-
           for (const leg of order) {
             const list = byLeg[leg];
             const pickIdx = list.findIndex(c =>
@@ -513,23 +532,18 @@ export default function App() {
             if (pickIdx !== -1) {
               const pick = list[pickIdx];
               legs.push({ leg: legLabel(leg), name: pick.name, time: pick.time, timeStr: pick.timeStr });
-              usedInTeam.add(pick.name);
-              globallyUsed.add(pick.name);
+              usedInTeam.add(pick.name); globallyUsed.add(pick.name);
             } else {
               legs.push({ leg: legLabel(leg), name: "(saknas)", time: NaN, timeStr: "" });
             }
           }
-
           const total = legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0);
           const complete = legs.every(l => isFinite(l.time));
           const dam = legs.filter(L => genderOf.get(L.name) === "Dam").length;
           const herr = legs.filter(L => genderOf.get(L.name) === "Herr").length;
 
-          if (complete && (!requireMix || (dam === 2 && herr === 2))) {
-            teams.push({ name: `Lag ${t+1}`, legs, total });
-          } else {
-            break;
-          }
+          if (complete && (!requireMix || (dam === 2 && herr === 2))) teams.push({ name: `Lag ${t+1}`, legs, total });
+          else break;
         }
 
         setGenerated({
@@ -539,21 +553,16 @@ export default function App() {
         return;
       }
 
-      // === EVEN / MANUAL: snake + balancing med mix-constraint ===
+      // EVEN / MANUAL
       const teams = Array.from({length: relayTeams}, (_,i)=>({ name:`Lag ${i+1}`, legs: [], total:0 }));
       const teamUsed = Array.from({length: relayTeams}, ()=> new Set());
       const usedGlobal = new Set();
 
       for (let li = 0; li < order.length; li++) {
         const legKey = order[li];
-
         let cand = pool
           .filter(s => s.nbest?.[legKey]?.timeSec != null && !usedGlobal.has(s.name))
-          .map(s => ({
-            name: s.name,
-            time: s.nbest[legKey].timeSec,
-            timeStr: secondsToTimeStr(s.nbest[legKey].timeSec)
-          }))
+          .map(s => ({ name: s.name, time: s.nbest[legKey].timeSec, timeStr: secondsToTimeStr(s.nbest[legKey].timeSec) }))
           .sort((a,b)=>a.time - b.time);
 
         const idxs = [...Array(relayTeams).keys()];
@@ -577,11 +586,8 @@ export default function App() {
 
       teams.forEach(t => { t.total = t.legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0); });
 
-      // ------- Balans (same-leg swaps), behåller 2+2 -------
-      const spread = (ts) => {
-        const totals = ts.map(t=>t.total);
-        return Math.max(...totals) - Math.min(...totals);
-      };
+      // Balans (same-leg swaps), behåll 2+2
+      const spread = (ts) => Math.max(...ts.map(t=>t.total)) - Math.min(...ts.map(t=>t.total));
       const maxIter = 50;
       let improved = true, iter = 0;
 
@@ -597,12 +603,12 @@ export default function App() {
               const L1 = A.legs[legIdx], L2 = B.legs[legIdx];
               if (!isFinite(L1.time) || !isFinite(L2.time)) continue;
 
-              // Behåll 2+2 efter swap
               if (requireMix) {
-                const g1 = genderOf.get(L1.name), g2 = genderOf.get(L2.name);
+                const g1 = normalizeGender(bestBySwimmer[L1.name]?.gender);
+                const g2 = normalizeGender(bestBySwimmer[L2.name]?.gender);
                 const cnt = (legs) => ({
-                  dam: legs.filter(x=>genderOf.get(x.name)==="Dam").length,
-                  herr: legs.filter(x=>genderOf.get(x.name)==="Herr").length
+                  dam: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Dam").length,
+                  herr: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Herr").length
                 });
                 const cA = cnt(A.legs), cB = cnt(B.legs);
                 const newA_dam  = cA.dam  - (g1==="Dam")  + (g2==="Dam");
@@ -621,9 +627,7 @@ export default function App() {
 
               const maxOthers = teams.reduce((m,t,k)=> k===i||k===j ? m : Math.max(m, t.total), -Infinity);
               const minOthers = teams.reduce((m,t,k)=> k===i||k===j ? m : Math.min(m, t.total), Infinity);
-              const newMax = Math.max(maxOthers, newA, newB);
-              const newMin = Math.min(minOthers, newA, newB);
-              const newSpread = newMax - newMin;
+              const newSpread = Math.max(maxOthers, newA, newB) - Math.min(minOthers, newA, newB);
 
               if (newSpread + 1e-9 < (bestSwap?.spread ?? curSpread)) {
                 bestSwap = { i, j, legIdx, newA, newB, spread: newSpread };
@@ -641,14 +645,12 @@ export default function App() {
           improved = true;
         }
       }
-      // ------- /balans -------
 
-      // filtrera bort icke-kompletta eller icke-mix
       const finalTeams = teams.filter(t => {
         const complete = t.legs.every(L => isFinite(L.time));
         if (!requireMix) return complete;
-        const dam = t.legs.filter(L => genderOf.get(L.name) === "Dam").length;
-        const herr = t.legs.filter(L => genderOf.get(L.name) === "Herr").length;
+        const dam = t.legs.filter(L => normalizeGender(bestBySwimmer[L.name]?.gender) === "Dam").length;
+        const herr = t.legs.filter(L => normalizeGender(bestBySwimmer[L.name]?.gender) === "Herr").length;
         return complete && dam === 2 && herr === 2;
       });
 
@@ -665,7 +667,32 @@ export default function App() {
   // ---- UI ----
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Simvaliderare – Tempus CSV (lagkapp)</h1>
+      {/* Brandad header */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 12, marginBottom: 12, padding: 12,
+        borderRadius: 12, background: "#fff", border: "1px solid #eee",
+        boxShadow: "0 1px 0 rgba(0,0,0,0.03)"
+      }}>
+        <img
+          src={sssLogo}
+          alt="Sundsvalls Simsällskap"
+          width={56}
+          height={56}
+          style={{
+            display: "block", borderRadius: 12, background: "#fff",
+            padding: 6, border: "1px solid #f0f0f0", objectFit: "contain"
+          }}
+        />
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 800, letterSpacing: 0.2 }}>
+            Lagkapp Generator för Simtävling
+          </div>
+          <div style={{ fontSize: 12, opacity: 0.75 }}>
+            Sundsvalls Simsällskap – “Klubben på hugget”
+          </div>
+        </div>
+      </div>
+
       <p style={{ marginBottom: 12 }}>
         1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass & ålder och visa/generera lag.
       </p>
@@ -836,25 +863,14 @@ export default function App() {
               <div style={{ ...cardBox, marginTop: 12 }}>
                 <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
                 <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-                  Alla simmare förvalda – klicka bort de som inte deltar.
+                  Alla simmare förvalda – klicka bort de som inte deltar. <br/>
+                  <strong>Tips:</strong> Klicka på en tid eller “(saknas)” för att <em>redigera</em>. Enter = spara, Esc = avbryt, lämna tomt = ta bort.
                 </div>
 
-                {/* Nya knappar: markera/avmarkera alla */}
+                {/* Knappar: markera/avmarkera alla */}
                 <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-                  <button
-                    style={btnStyle}
-                    onClick={selectAllVisible}
-                    title="Markera alla simmare i den filtrerade listan"
-                  >
-                    Markera alla
-                  </button>
-                  <button
-                    style={{ ...btnStyle, background: "#666" }}
-                    onClick={clearAllSelected}
-                    title="Avmarkera alla simmare"
-                  >
-                    Avmarkera alla
-                  </button>
+                  <button style={btnStyle} onClick={selectAllVisible} title="Markera alla synliga">Markera alla</button>
+                  <button style={btnSubtle} onClick={clearAllSelected} title="Avmarkera alla">Avmarkera alla</button>
                 </div>
 
                 <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
@@ -881,9 +897,53 @@ export default function App() {
                             <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
                             <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
                             <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
-                            {reqKeys.map((k)=> (
-                              <td key={k} className="border px-2 py-1 whitespace-nowrap">{nbest?.[k]?.timeStr || ""}</td>
-                            ))}
+                            {reqKeys.map((k)=> {
+                              const cell = nbest?.[k];
+                              const isEditing = editing && editing.name === name && editing.key === k;
+                              const display = cell?.timeStr || "";
+                              const manual = !!cell?.manual;
+
+                              return (
+                                <td key={k} className="border px-2 py-1 whitespace-nowrap">
+                                  {isEditing ? (
+                                    <input
+                                      autoFocus
+                                      type="text"
+                                      value={editing.value}
+                                      onChange={(e)=> setEditing(ed => ({ ...ed, value: e.target.value }))}
+                                      onBlur={() => {
+                                        const ok = updateTime(name, k, editing.value);
+                                        if (!ok) return; // låt användaren rätta ogiltigt värde
+                                        setEditing(null);
+                                      }}
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter") {
+                                          const ok = updateTime(name, k, editing.value);
+                                          if (ok) setEditing(null);
+                                        } else if (e.key === "Escape") {
+                                          setEditing(null);
+                                        }
+                                      }}
+                                      placeholder="mm:ss.hh eller ss.hh"
+                                      style={{ border: "1px solid #bbb", borderRadius: 6, padding: "4px 6px", minWidth: 90 }}
+                                    />
+                                  ) : (
+                                    <span
+                                      onClick={() => setEditing({ name, key: k, value: display || "" })}
+                                      title="Klicka för att redigera"
+                                      style={{
+                                        cursor: "pointer",
+                                        fontStyle: manual ? "italic" : "normal",
+                                        color: manual ? "#1d39c4" : "inherit",
+                                      }}
+                                    >
+                                      {display || <span style={{ opacity: 0.5 }}>(saknas)</span>}
+                                      {manual && <span title="Manuellt satt tid"> *</span>}
+                                    </span>
+                                  )}
+                                </td>
+                              );
+                            })}
                           </tr>
                         );
                       })}
@@ -892,40 +952,55 @@ export default function App() {
                 </div>
 
                 <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
-                  Valda simmare: {selectedSwimmers.size}
+                  Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
                 </div>
               </div>
             )}
 
             {generated && (
-              <div style={{ ...cardBox, marginTop: 12 }}>
-                <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Föreslagna lag</h3>
-                {generated.note && <div style={noteBox("#fffbe6","#ad6800")}>⚠ {generated.note}</div>}
-                {generated.teams.length > 0 ? generated.teams.map((team, idx) => (
-                  <div key={idx} style={{ marginBottom: 12 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                      {team.name} — Total: {secondsToTimeStr(team.total)}
-                    </div>
-                    <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6 }}>
-                      <thead>
-                        <tr>
-                          <th className="border px-2 py-1 text-left">Sträcka</th>
-                          <th className="border px-2 py-1 text-left">Simmare</th>
-                          <th className="border px-2 py-1 text-left">Tid</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {team.legs.map((L, i) => (
-                          <tr key={i}>
-                            <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
-                            <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
-                            <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
+              <div
+                style={{
+                  ...cardBox,
+                  marginTop: 12,
+                  position: "relative",
+                  overflow: "hidden",
+                  backgroundImage: `url(${sssLogo})`,
+                  backgroundRepeat: "no-repeat",
+                  backgroundPosition: "right -30px top -30px",
+                  backgroundSize: "220px",
+                  isolation: "isolate"
+                }}
+              >
+                <div style={{ position: "absolute", inset: 0, background: "rgba(255,255,255,0.75)", zIndex: 0 }} />
+                <div style={{ position: "relative", zIndex: 1 }}>
+                  <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Föreslagna lag</h3>
+                  {generated.note && <div style={noteBox("#fffbe6","#ad6800")}>⚠ {generated.note}</div>}
+                  {generated.teams.length > 0 ? generated.teams.map((team, idx) => (
+                    <div key={idx} style={{ marginBottom: 12 }}>
+                      <div style={{ fontWeight: 700, marginBottom: 6 }}>
+                        {team.name} — Total: {secondsToTimeStr(team.total)}
+                      </div>
+                      <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6, background: "#fff" }}>
+                        <thead>
+                          <tr>
+                            <th className="border px-2 py-1 text-left">Sträcka</th>
+                            <th className="border px-2 py-1 text-left">Simmare</th>
+                            <th className="border px-2 py-1 text-left">Tid</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )) : <div style={{ fontSize: 14, opacity: 0.8 }}>Inga kompletta lag kunde genereras.</div>}
+                        </thead>
+                        <tbody>
+                          {team.legs.map((L, i) => (
+                            <tr key={i}>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )) : <div style={{ fontSize: 14, opacity: 0.8 }}>Inga kompletta lag kunde genereras.</div>}
+                </div>
               </div>
             )}
           </div>
@@ -935,18 +1010,34 @@ export default function App() {
   );
 }
 
+/* ====== Tema & UI ====== */
+const THEME = {
+  primary: "#f4c21f",     // gul från loggan
+  primaryText: "#111",
+  border: "#e5e5e5",
+};
+
 const btnStyle = {
-  border: "1px solid #ccc",
-  background: "#111",
-  color: "#fff",
+  border: `1px solid ${THEME.border}`,
+  background: THEME.primary,
+  color: THEME.primaryText,
   padding: "8px 12px",
   borderRadius: 8,
   cursor: "pointer",
 };
 
-const selectStyle = { border: "1px solid #ccc", padding: 8, borderRadius: 8, width: "100%" };
+const btnSubtle = {
+  border: `1px solid ${THEME.border}`,
+  background: "#fff",
+  color: "#111",
+  padding: "8px 12px",
+  borderRadius: 8,
+  cursor: "pointer",
+};
+
+const selectStyle = { border: `1px solid ${THEME.border}`, padding: 8, borderRadius: 8, width: "100%" };
 const labelStyle  = { fontSize: 12, opacity: 0.8, marginBottom: 4 };
-const cardBox     = { border: "1px solid #eee", borderRadius: 12, padding: 12, background: "#fafafa" };
+const cardBox     = { border: `1px solid ${THEME.border}`, borderRadius: 12, padding: 12, background: "#fafafa" };
 
 function noteBox(bg, color) {
   return { background: bg, color, border: `1px solid ${color}33`, padding: 12, borderRadius: 8, marginTop: 8 };
