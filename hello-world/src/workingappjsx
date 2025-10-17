@@ -25,7 +25,7 @@ export default function App() {
   const [summary, setSummary] = useState(null);
 
   // UI-val
-  const [relayType, setRelayType] = useState("");       // 4x50 frisim, 4x100 frisim, 4x50 medley, ...
+  const [relayType, setRelayType] = useState("");       // 4x50 frisim, 4x100 frisim, 4x200 frisim, 4x50 medley, ...
   const [relayClass, setRelayClass] = useState("");     // Herr | Dam | Mix
   const [selectedAges, setSelectedAges] = useState([]); // multi-select ages
   const [showSwimmersBox, setShowSwimmersBox] = useState(false);
@@ -340,6 +340,13 @@ export default function App() {
     return arr;
   }, [bestBySwimmer, relayClass, selectedAges, buildStrategy, reqKeys]);
 
+  // 🔹 Auto-bocka alla när rutan visas eller listan uppdateras
+  useEffect(() => {
+    if (!showSwimmersBox) return;
+    const all = new Set(filteredSwimmers.map(s => s.name));
+    setSelectedSwimmers(all);
+  }, [showSwimmersBox, filteredSwimmers]);
+
   function labelForKey(k) {
     switch (k) {
       case "frisim_50":  return "50 frisim";
@@ -363,12 +370,12 @@ export default function App() {
     });
   }
 
-  // ---- Laggenerering med MIX-regel ----
+  // ---- Laggenerering med MIX-regel + bockningskrav ----
   function generateTeams() {
     if (!relayType) { setGenerated(null); return; }
 
-    // baslista (respektera manuellt urval om strategi = manual)
-    const pool = (buildStrategy === "manual" && selectedSwimmers.size > 0)
+    // 🔹 Använd alltid endast bockade om några finns, annars alla filtrerade
+    const pool = (selectedSwimmers.size > 0)
       ? filteredSwimmers.filter(s => selectedSwimmers.has(s.name))
       : filteredSwimmers.slice();
 
@@ -391,7 +398,7 @@ export default function App() {
 
       withTime.sort((a,b)=>a.t - b.t);
 
-      // MIX: alltid 2 damer + 2 herrar per lag, snabbaste möjliga kombinationer
+      // MIX: alltid 2 damer + 2 herrar per lag
       if (requireMix) {
         const females = withTime.filter(p => genderOf.get(p.name) === "Dam");
         const males   = withTime.filter(p => genderOf.get(p.name) === "Herr");
@@ -731,12 +738,6 @@ export default function App() {
       {validated && (
         <div style={{ marginTop: 8 }}>
           <div>
-            <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>OK</h2>
-            <ul style={{ marginBottom: 12 }}>
-              <li>Simmare: {summary?.swimmers ?? 0}</li>
-              <li>Dam: {summary?.dam ?? 0}</li>
-              <li>Herr: {summary?.herr ?? 0}</li>
-            </ul>
 
             {/* Val för lagkapp / klass / ålder */}
             <div style={cardBox}>
@@ -793,7 +794,11 @@ export default function App() {
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
                 <button
                   style={btnStyle}
-                  onClick={() => setShowSwimmersBox(true)}
+                  onClick={() => {
+                    const all = new Set(filteredSwimmers.map(s => s.name));
+                    setSelectedSwimmers(all);
+                    setShowSwimmersBox(true);
+                  }}
                   disabled={!relayType}
                   title={!relayType ? "Välj lagkapp" : "Visa filtrerade simmare"}
                 >
@@ -821,7 +826,10 @@ export default function App() {
 
             {showSwimmersBox && (
               <div style={{ ...cardBox, marginTop: 12 }}>
-                <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Simmare</h3>
+                <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
+                  Alla simmare förvalda – klicka bort de som inte deltar.
+                </div>
 
                 <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
                   <table className="min-w-full border-collapse">
@@ -858,7 +866,7 @@ export default function App() {
                 </div>
 
                 <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
-                  Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
+                  Valda simmare: {selectedSwimmers.size}
                 </div>
               </div>
             )}
@@ -917,4 +925,3 @@ const cardBox     = { border: "1px solid #eee", borderRadius: 12, padding: 12, b
 function noteBox(bg, color) {
   return { background: bg, color, border: `1px solid ${color}33`, padding: 12, borderRadius: 8, marginTop: 8 };
 }
-
