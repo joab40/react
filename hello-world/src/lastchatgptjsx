@@ -1,0 +1,1193 @@
+import { useMemo, useRef, useState, useEffect } from "react";
+import sssLogoLight from "./assets/sss_logga_no_year.png";
+import sssLogoDark from "./assets/sss_logga_no_year_dark.png";
+
+/** Förladdning av default-CSV (Vite 5/6-kompatibel) */
+const allCsvFiles = import.meta.glob("./*.csv", { query: "?raw", import: "default", eager: true });
+let defaultCsvPath = null;
+let defaultCsvText = null;
+for (const path of Object.keys(allCsvFiles)) {
+  if (path.toLowerCase().endsWith(".csv")) {
+    defaultCsvPath = path;
+    defaultCsvText = allCsvFiles[path];
+    break;
+  }
+}
+
+export default function App() {
+  // --- Data/validering ---
+  const [rawText, setRawText] = useState("");
+  const [rows, setRows] = useState([]);
+  const [headers, setHeaders] = useState([]);
+  const [errors, setErrors] = useState([]);
+  const [validated, setValidated] = useState(false);
+
+  // sammanställning per simmare
+  // bestBySwimmer[name] = { gender, club, age, nbest: { "<event>_<25|50>": {timeSec, timeStr, manual?} } }
+  const [bestBySwimmer, setBestBySwimmer] = useState({});
+  const [summary, setSummary] = useState(null);
+
+  // --- UI-val ---
+  const [relayType, setRelayType] = useState("");       // 4x50 frisim / 4x100 frisim / 4x200 frisim / 4x50 medley / 4x100 medley
+  const [relayClass, setRelayClass] = useState("Alla"); // Herr | Dam | Mix | Alla
+  const [selectedAges, setSelectedAges] = useState([]); // multi-select ages
+  const [poolSel, setPoolSel] = useState("Alla");       // Alla | 25 | 50
+
+  const [clubSel, setClubSel] = useState("Sundsvalls SS"); // “Alla föreningar” eller en klubb
+  const [clubs, setClubs] = useState(["Alla föreningar", "Sundsvalls SS"]);
+
+  const [showSwimmersBox, setShowSwimmersBox] = useState(false);
+  const [selectedSwimmers, setSelectedSwimmers] = useState(new Set());
+
+  // Antal lag + strategi
+  const [relayTeams, setRelayTeams] = useState(1);              // 1..5
+  const [buildStrategy, setBuildStrategy] = useState("manual"); // manual | fastest | even
+
+  // Genererade lag
+  const [generated, setGenerated] = useState(null);
+
+  // Inline-edit
+  const [editing, setEditing] = useState(null); // { name, key, value }
+
+  // Statusrad för validering
+  const [valStatus, setValStatus] = useState({ state: "idle", message: "" });
+  // state: "idle" | "validating" | "success" | "error"
+
+  // Default-filnamn (visning)
+  const [defaultFileName, setDefaultFileName] = useState("");
+  const fileRef = useRef(null);
+
+  // Dark mode
+  const [isDark, setIsDark] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false
+  );
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e) => setIsDark(e.matches);
+    if (mql.addEventListener) mql.addEventListener("change", handler);
+    else mql.addListener?.(handler);
+    return () => {
+      if (mql.removeEventListener) mql.removeEventListener("change", handler);
+      else mql.removeListener?.(handler);
+    };
+  }, []);
+  const sssLogo = isDark ? sssLogoDark : sssLogoLight;
+
+  // Läs in första .csv i katalogen – utan att validera automatiskt
+  useEffect(() => {
+    if (defaultCsvText) {
+      setRawText(defaultCsvText);
+      const parts = (defaultCsvPath || "").split("/");
+      setDefaultFileName(parts[parts.length - 1] || "");
+    }
+  }, []);
+
+  // Injicera @keyframes spin (en gång)
+  useEffect(() => {
+    const id = "app-spin-keyframes";
+    if (!document.getElementById(id)) {
+      const style = document.createElement("style");
+      style.id = id;
+      style.innerHTML = `@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`;
+      document.head.appendChild(style);
+    }
+  }, []);
+
+  // ---- CSV/parse helpers ----
+  function detectDelimiter(sample) {
+    const sc = (sample.match(/;/g) || []).length;
+    const cc = (sample.match(/,/g) || []).length;
+    return sc >= cc ? ";" : ",";
+  }
+
+  function smartSplit(line, delimiter) {
+    const cols = [];
+    let cur = "", inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; continue; }
+      if (ch === delimiter && !inQuotes) { cols.push(cur.trim()); cur = ""; }
+      else { cur += ch; }
+    }
+    cols.push(cur.trim());
+    return cols.map((s) => s.replace(/^"|"$/g, "").trim());
+  }
+
+  function findTableStartAndParse(text) {
+    const delimiter = detectDelimiter(text.slice(0, 2000));
+    const lines = text.replace(/\r\n?/g, "\n").split("\n");
+
+    // hitta header-rad
+    let headerIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const L = lines[i];
+      if (/(Simidrottare|Namn)/.test(L) && /Gren/.test(L) && /Tid/.test(L)) { headerIdx = i; break; }
+    }
+    const allLines = headerIdx >= 0 ? lines.slice(headerIdx) : lines;
+    if (!allLines.length) return { headers: [], rows: [] };
+
+    const hdrs = smartSplit(allLines[0], delimiter);
+    const headerSet = new Set(hdrs.map((h) => h.trim()));
+
+    const body = allLines.slice(1)
+      .map((ln) => smartSplit(ln, delimiter))
+      .filter((cols) => cols.some((c) => (c || "").trim().length > 0))
+      .filter((cols) => {
+        let headerHits = 0; for (const c of cols) if (headerSet.has((c || "").trim())) headerHits++;
+        return headerHits < 3 && (cols[0] || "").trim() !== "Placering";
+      });
+
+    const rows = body.map((cols) => {
+      const obj = {};
+      hdrs.forEach((h, i) => { obj[h.trim()] = (cols[i] ?? "").trim(); });
+      return obj;
+    });
+
+    return { headers: hdrs, rows };
+  }
+
+  function normalizeHeaderName(name) {
+    return String(name).toLowerCase().replace(/\s+/g, " ")
+      .replaceAll("å","a").replaceAll("ä","a").replaceAll("ö","o");
+  }
+
+  function pickColumn(headers, candidates) {
+    const normMap = new Map(headers.map((h) => [normalizeHeaderName(h), h]));
+    for (const c of candidates) {
+      const norm = normalizeHeaderName(c);
+      if (normMap.has(norm)) return normMap.get(norm);
+      for (const [k, v] of normMap.entries()) if (k.includes(norm)) return v;
+    }
+    return null;
+  }
+
+  // Normalisering av text
+  function normStr(s) {
+    return String(s||"").toLowerCase()
+      .replaceAll("å","a").replaceAll("ä","a").replaceAll("ö","o")
+      .replace(/\s+/g," ").trim();
+  }
+
+  // Event-nycklar
+  function normalizeEvent(e) {
+    const s = normStr(e).replace(/meter|m\.|m /g, "m ").replace(/\s+/g, " ");
+    const has50  = /(^|\s)50\s*m/.test(s)  || /\b50m\b/.test(s);
+    const has100 = /(^|\s)100\s*m/.test(s) || /\b100m\b/.test(s);
+    const has200 = /(^|\s)200\s*m/.test(s) || /\b200m\b/.test(s);
+
+    const isFree   = /frisim|freestyle/.test(s);
+    const isBack   = /rygg|ryggsim|backstroke/.test(s);
+    const isBreast = /bröst|brost|breast/.test(s);
+    const isFly    = /fjäril|fjaril|butterfly/.test(s);
+
+    if (has50 && isFree)   return "frisim_50";
+    if (has50 && isBack)   return "rygg_50";
+    if (has50 && isBreast) return "brost_50";
+    if (has50 && isFly)    return "fjaril_50";
+
+    if (has100 && isFree)   return "frisim_100";
+    if (has200 && isFree)   return "frisim_200";
+    if (has100 && isBack)   return "rygg_100";
+    if (has100 && isBreast) return "brost_100";
+    if (has100 && isFly)    return "fjaril_100";
+    return null;
+  }
+
+  function parseTimeToSeconds(str) {
+    if (!str) return NaN;
+    const s = String(str).trim().replace(/,/g, ".");
+    const clean = s.replace(/[^0-9:\.]/g, "");
+    if (!clean) return NaN;
+    const parts = clean.split(":");
+    if (parts.length === 1) return parseFloat(parts[0]);
+    if (parts.length === 2) return parseInt(parts[0], 10) * 60 + parseFloat(parts[1]);
+    const h = parseInt(parts[0],10)||0, m = parseInt(parts[1],10)||0;
+    return h*3600 + m*60 + parseFloat(parts.slice(2).join(":"));
+  }
+
+  function secondsToTimeStr(sec) {
+    if (!isFinite(sec)) return "";
+    const m = Math.floor(sec / 60); const s = sec - m * 60;
+    return `${m}:${s.toFixed(2).padStart(5, "0")}`;
+  }
+
+  function normalizeGender(val) {
+    const s = String(val || "").toLowerCase();
+    if (!s) return "";
+    if (["dam","kvinna","f","female","flicka","flickor"].some(x => s.includes(x))) return "Dam";
+    if (["herr","man","m","male","pojke","pojkar"].some(x => s.includes(x))) return "Herr";
+    if (s === "k") return "Dam";
+    if (s === "h") return "Herr";
+    return "";
+  }
+
+  // Vilka tider behövs beroende på lagkapp (event-keys utan pool)
+  function requiredEventKeysBase(rt) {
+    const s = normStr(rt);
+    if (/4x50\s*frisim/.test(s))  return ["frisim_50"];
+    if (/4x100\s*frisim/.test(s)) return ["frisim_100"];
+    if (/4x200\s*frisim/.test(s)) return ["frisim_200"];
+    if (/4x50\s*medley/.test(s))  return ["rygg_50","brost_50","fjaril_50","frisim_50"];
+    if (/4x100\s*medley/.test(s)) return ["rygg_100","brost_100","fjaril_100","frisim_100"];
+    return [];
+  }
+
+  const reqKeysBase = useMemo(() => requiredEventKeysBase(relayType), [relayType]);
+
+  // Pool-aware nyckel: läs från poolSel (“Alla” ⇒ välj bästa tillgängliga vid användning)
+  const keyWithPool = (baseKey, wantPool /* "25"|"50"| "Alla" */) =>
+    wantPool === "25" ? `${baseKey}_25` :
+    wantPool === "50" ? `${baseKey}_50` :
+    // "Alla" – lämna basnyckeln, men vi slår upp med preferens senare (50→25)
+    baseKey;
+
+  function labelForKey(baseKey) {
+    const map = {
+      frisim_50:"50 frisim", frisim_100:"100 frisim", frisim_200:"200 frisim",
+      rygg_50:"50 rygg", rygg_100:"100 rygg",
+      brost_50:"50 bröst", brost_100:"100 bröst",
+      fjaril_50:"50 fjäril", fjaril_100:"100 fjäril",
+    };
+    return map[baseKey] || baseKey;
+  }
+
+  // Hjälpare: hämta rätt tid med hänsyn till poolSel (Alla ⇒ prefer 50, annars 25)
+  function getTimeForPool(nbest, baseKey) {
+    if (!nbest) return null;
+    const p50 = nbest[`${baseKey}_50`];
+    const p25 = nbest[`${baseKey}_25`];
+    if (poolSel === "50") return p50 || null;
+    if (poolSel === "25") return p25 || null;
+    // Alla ⇒ prioritera 50 om finns, annars 25
+    return p50 || p25 || null;
+  }
+
+  // ---- Validering ----
+  function onValidate() {
+    setErrors([]);
+    setValidated(false);
+    setBestBySwimmer({});
+    setSummary(null);
+    setShowSwimmersBox(false);
+    setSelectedSwimmers(new Set());
+    setGenerated(null);
+    setEditing(null);
+
+    if (!rawText) {
+      setValStatus({ state: "error", message: "Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx." });
+      setErrors(["Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx."]);
+      return;
+    }
+
+    try {
+      setValStatus({ state: "validating", message: "Validerar filen…" });
+
+      const { headers: hdrs, rows } = findTableStartAndParse(rawText);
+      setHeaders(hdrs); setRows(rows);
+
+      if (hdrs.length === 0 || rows.length === 0) {
+        const msg = "Kunde inte hitta tabell i filen. Kontrollera att det är en Tempus-rapport.";
+        setErrors([msg]);
+        setValStatus({ state: "error", message: msg });
+        return;
+      }
+
+      const nameCol   = pickColumn(hdrs, ["Simidrottare","Namn","Simmare","Namn på simmare","Simmarens namn"]);
+      const eventCol  = pickColumn(hdrs, ["Gren","Simgren","Distans"]);
+      const timeCol   = pickColumn(hdrs, ["Tid","Resultat","Sluttid"]);
+      const genderCol = pickColumn(hdrs, ["Kön","Kon","Gender","K"]);
+      const ageCol    = pickColumn(hdrs, ["Ålder vid loppet","Alder vid loppet","Ålder idag","Alder idag","Ålder","Alder"]);
+      const bornCol   = pickColumn(hdrs, ["Född","Fodd","Födelseår","Fodelsear","Födelsedatum","Fodelsedatum"]);
+      const dateCol   = pickColumn(hdrs, ["Datum","Tävlingsdatum","Tavlingsdatum","Date"]);
+      const poolCol   = pickColumn(hdrs, ["Bassäng","Bassang","Pool","Pool length"]);
+      const clubCol   = pickColumn(hdrs, ["Förening","Forening","Klubb","Club","Team"]);
+      const meetCol   = pickColumn(hdrs, ["Tävling","Tavling","Meet","Competition"]);
+
+      const missing = [];
+      if (!nameCol)  missing.push("Namn/Simidrottare");
+      if (!eventCol) missing.push("Gren");
+      if (!timeCol)  missing.push("Tid");
+      if (missing.length) {
+        const msg = `Saknar obligatoriska kolumner: ${missing.join(", ")}`;
+        setErrors([msg]);
+        setValStatus({ state: "error", message: msg });
+        return;
+      }
+
+      // Säsongsår: använd senaste årtal i Datum-kolumnen om möjligt, annars 2025
+      let seasonYear = 2025;
+      if (dateCol) {
+        const yrs = [];
+        for (const r of rows) {
+          const d = String(r[dateCol] || "");
+          const m = d.match(/(20\d{2})/);
+          if (m) yrs.push(+m[1]);
+        }
+        if (yrs.length) seasonYear = Math.max(...yrs);
+      }
+
+      const best = {}; // name -> { gender, club, age(class), nbest }
+
+      // Samla klubbar
+      const clubSet = new Set();
+
+      rows.forEach((r) => {
+        const name = (r[nameCol]||"").trim();
+        const gren = (r[eventCol]||"").trim();
+        const tidRaw = (r[timeCol]||"").trim();
+        const konRaw = genderCol ? (r[genderCol]||"").trim() : "";
+        const clubRaw = clubCol ? (r[clubCol]||"").trim() : "";
+
+        if (!name && !gren && !tidRaw) return; // tom rad
+
+        // --- Tid ---
+        const sec = parseTimeToSeconds(tidRaw);
+
+        // --- Pool: kolumnen "Bassäng" i första hand; annars fallback i Tävling/Gren ---
+        const poolRaw = poolCol ? String(r[poolCol] || "").trim().toLowerCase() : "";
+        const tavlingRaw = String(meetCol ? (r[meetCol] || "") : "").toLowerCase();
+        const grenRaw = String(gren || "").toLowerCase();
+
+        let poolType = "";
+        if (poolRaw.includes("25")) poolType = "25";
+        else if (poolRaw.includes("50")) poolType = "50";
+        else if (/\(25m\)/i.test(tavlingRaw) || /\b25m\b/.test(tavlingRaw) || /\(25m\)/i.test(grenRaw) || /\b25m\b/.test(grenRaw)) poolType = "25";
+        else if (/\(50m\)/i.test(tavlingRaw) || /\b50m\b/.test(tavlingRaw) || /\(50m\)/i.test(grenRaw) || /\b50m\b/.test(grenRaw)) poolType = "50";
+
+        // --- Ålder/klass: säsongsår − födelseår (fix för Linus 2010 ⇒ 15 år 2025) ---
+        let classAge = "";
+        // 1) försök exakt födelseår från “Född” (fyra siffror) eller “Födelsedatum”
+        let bornYear = NaN;
+        const bornField = String(r[bornCol] || "");
+        const mY = bornField.match(/(\d{4})/);
+        if (mY) bornYear = +mY[1];
+
+        if (!isFinite(bornYear) && ageCol) {
+          // om “Ålder idag/vid loppet” finns men vi vill klassificera på säsongsår,
+          // försök härleda via tävlingsår (säsongsår - “ålder vid loppet” + (tävlingsår==säsong?0:justera))
+          const ageAtRace = Number(String(r[ageCol]).replace(/[^0-9]/g, ""));
+          if (isFinite(ageAtRace)) {
+            const raceYearMatch = String(r[dateCol] || "").match(/(20\d{2})/);
+            const raceYear = raceYearMatch ? +raceYearMatch[1] : seasonYear;
+            bornYear = raceYear - ageAtRace; // approx
+          }
+        }
+        if (isFinite(bornYear)) classAge = seasonYear - bornYear;
+
+        // init simmare
+        if (!best[name]) best[name] = { gender: konRaw || "", club: clubRaw || "", age: Number.isFinite(classAge)?classAge:"", nbest: {} };
+
+        // uppdatera klubb
+        if (clubRaw) {
+          clubSet.add(clubRaw);
+          if (!best[name].club) best[name].club = clubRaw;
+        }
+
+        // --- Event-nyckel med pool-suffix ---
+        const baseKey = normalizeEvent(gren);
+        if (name && baseKey && isFinite(sec) && (poolType === "25" || poolType === "50")) {
+          const fullKey = `${baseKey}_${poolType}`;
+          const prev = best[name].nbest[fullKey];
+          if (!prev || sec < prev.timeSec) {
+            best[name].nbest[fullKey] = { timeSec: sec, timeStr: secondsToTimeStr(sec) };
+          }
+        }
+
+        // kön/ålder fallback
+        if (!best[name].gender && konRaw) best[name].gender = konRaw;
+        if (!best[name].age && Number.isFinite(classAge)) best[name].age = classAge;
+      });
+
+      // Summering
+      const genders = Object.values(best).map((b) => normalizeGender(b.gender));
+      const dam = genders.filter((g) => g === "Dam").length;
+      const herr = genders.filter((g) => g === "Herr").length;
+
+      // Klubblista
+      const sortedClubs = Array.from(clubSet).sort((a,b)=>a.localeCompare(b,"sv"));
+      const defaultClub = sortedClubs.includes("Sundsvalls SS") ? "Sundsvalls SS" : (sortedClubs[0] || "Alla föreningar");
+      const clubList = ["Alla föreningar", ...sortedClubs];
+
+      setBestBySwimmer(best);
+      setValidated(true);
+      setClubs(clubList);
+      setClubSel(defaultClub);
+      const sumObj = { swimmers: Object.keys(best).length, dam, herr, seasonYear };
+      setSummary(sumObj);
+      setValStatus({ state: "success", message: `Validering klar – ${sumObj.swimmers} simmare (Dam ${sumObj.dam} / Herr ${sumObj.herr}) • Säsong ${sumObj.seasonYear}` });
+    } catch (e) {
+      setValStatus({ state: "error", message: "Ett oväntat fel inträffade under valideringen. Se konsolen." });
+      console.error(e);
+    }
+  }
+
+  // Ålderslista (multi-select)
+  const availableAges = useMemo(() => {
+    const s = new Set();
+    Object.values(bestBySwimmer).forEach((b) => { if (b.age !== "" && Number.isFinite(b.age)) s.add(b.age); });
+    return Array.from(s).sort((a,b)=>a-b);
+  }, [bestBySwimmer]);
+
+  // Filtrering + sortering i listan
+  const filteredSwimmers = useMemo(() => {
+    const list = Object.entries(bestBySwimmer).map(([name, data]) => ({ name, ...data }));
+    const ages = new Set(selectedAges.map(Number));
+
+    let arr = list.filter(({ gender, age, club }) => {
+      const g = normalizeGender(gender);
+      const passClass = relayClass === "Alla" || relayClass === "Mix" || (!relayClass) || g === relayClass;
+      const passAge = ages.size === 0 || (Number.isFinite(age) && ages.has(age));
+      const passClub = clubSel === "Alla föreningar" || (club || "") === clubSel;
+      return passClass && passAge && passClub;
+    });
+
+    // sortering
+    if (buildStrategy === "fastest" && reqKeysBase.length > 0) {
+      arr.sort((a, b) => {
+        // tillgängliga tider (med poolSel)
+        const aAvail = reqKeysBase.filter(k => !!getTimeForPool(a.nbest, k)).length;
+        const bAvail = reqKeysBase.filter(k => !!getTimeForPool(b.nbest, k)).length;
+        if (aAvail !== bAvail) return bAvail - aAvail;
+
+        // summa av tider för de ben som finns (INF om saknas)
+        const big = 1e9;
+        const aSum = reqKeysBase.reduce((s, k) => s + (getTimeForPool(a.nbest, k)?.timeSec ?? big), 0);
+        const bSum = reqKeysBase.reduce((s, k) => s + (getTimeForPool(b.nbest, k)?.timeSec ?? big), 0);
+        if (aSum !== bSum) return aSum - bSum;
+
+        return a.name.localeCompare(b.name, "sv");
+      });
+    } else {
+      arr.sort((a,b)=>a.name.localeCompare(b.name, "sv"));
+    }
+    return arr;
+  }, [bestBySwimmer, relayClass, selectedAges, buildStrategy, reqKeysBase, clubSel, poolSel]);
+
+  // Auto-bocka alla när rutan visas eller listan uppdateras
+  useEffect(() => {
+    if (!showSwimmersBox) return;
+    const all = new Set(filteredSwimmers.map(s => s.name));
+    setSelectedSwimmers(all);
+  }, [showSwimmersBox, filteredSwimmers]);
+
+  function toggleSelect(name) {
+    setSelectedSwimmers(prev => {
+      const n = new Set(prev);
+      if (n.has(name)) n.delete(name); else n.add(name);
+      return n;
+    });
+  }
+  function selectAllVisible() { setSelectedSwimmers(new Set(filteredSwimmers.map(s => s.name))); }
+  function clearAllSelected() { setSelectedSwimmers(new Set()); }
+
+  // Inline-uppdatering (skriver mot aktiv poolSel; “Alla” ⇒ prioriterar 50)
+  function updateTime(swimmerName, baseKey, newTimeStr) {
+    // bestäm vilket pool-suffix vi ska skriva mot
+    const targetPool =
+      poolSel === "25" ? "25" :
+      poolSel === "50" ? "50" :
+      // "Alla" – skriv mot 50 om möjligt, annars 25
+      (getTimeForPool(bestBySwimmer[swimmerName]?.nbest, baseKey)?.timeStr
+        ? (bestBySwimmer[swimmerName].nbest[`${baseKey}_50`] ? "50" : "25")
+        : "50");
+
+    const fullKey = `${baseKey}_${targetPool}`;
+    const trimmed = String(newTimeStr ?? "").trim();
+
+    // tomt ⇒ radera
+    if (!trimmed) {
+      setBestBySwimmer(prev => {
+        const copy = { ...prev };
+        const s = copy[swimmerName];
+        if (!s) return prev;
+        const nbest = { ...(s.nbest || {}) };
+        if (nbest[fullKey]) {
+          delete nbest[fullKey];
+          copy[swimmerName] = { ...s, nbest };
+        }
+        return copy;
+      });
+      return true;
+    }
+
+    const sec = parseTimeToSeconds(trimmed);
+    if (!isFinite(sec)) return false;
+    setBestBySwimmer(prev => {
+      const copy = { ...prev };
+      const s = copy[swimmerName] || { gender: "", club: "", age: "", nbest: {} };
+      const nbest = { ...(s.nbest || {}) };
+      nbest[fullKey] = { timeSec: sec, timeStr: secondsToTimeStr(sec), manual: true };
+      copy[swimmerName] = { ...s, nbest };
+      return copy;
+    });
+    return true;
+  }
+
+  // ---- Laggenerering (respekterar poolSel + Mix/Alla) ----
+  function generateTeams() {
+    if (!relayType) { setGenerated(null); return; }
+
+    const poolRequire = poolSel; // Alla | 25 | 50
+
+    // baslista – använd bockade om några finns
+    const pool = (selectedSwimmers.size > 0)
+      ? filteredSwimmers.filter(s => selectedSwimmers.has(s.name))
+      : filteredSwimmers.slice();
+
+    if (pool.length === 0) { setGenerated({ note: "Inga simmare i urvalet.", teams: [] }); return; }
+
+    const sum = (arr) => arr.reduce((a,b)=>a+b,0);
+
+    const requireMix = relayClass === "Mix";
+    const ignoreGender = relayClass === "Alla";
+    const genderOf = new Map(pool.map(p => [p.name, normalizeGender(p.gender)]));
+
+    const needed = reqKeysBase.slice(); // bas-keys (utan pool)
+
+    // Enben (frisim)
+    if (needed.length === 1 && needed[0].startsWith("frisim")) {
+      const base = needed[0];
+      const withTime = pool.map(p => ({ p, t: getTimeForPool(p.nbest, base) }))
+        .filter(x => x.t && isFinite(x.t.timeSec))
+        .map(x => ({ ...x.p, t: x.t.timeSec, tStr: x.t.timeStr }));
+      if (withTime.length < 4) { setGenerated({ note: "Färre än 4 med giltig tid.", teams: [] }); return; }
+      withTime.sort((a,b)=>a.t - b.t);
+
+      if (requireMix) {
+        const females = withTime.filter(p => genderOf.get(p.name) === "Dam");
+        const males   = withTime.filter(p => genderOf.get(p.name) === "Herr");
+        let fi = 0, mi = 0;
+        const teams = [];
+        for (let t = 0; t < relayTeams; t++) {
+          const grp = [];
+          if (fi + 2 <= females.length) grp.push(...females.slice(fi, fi+2));
+          if (mi + 2 <= males.length)   grp.push(...males.slice(mi, mi+2));
+          if (grp.length === 4) {
+            fi += 2; mi += 2;
+            grp.sort((a,b)=>a.t - b.t);
+            const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: s.tStr, stroke: "Frisim" }));
+            teams.push({ name: `Lag ${t+1}`, legs, total: sum(grp.map(x=>x.t)) });
+          } else break;
+        }
+        setGenerated({ note: teams.length === 0 ? "Inte tillräckligt med både Dam och Herr (behöver 2+2 per lag)." : null, teams });
+        return;
+      }
+
+      // “Alla” ⇒ ignorera kön helt; Herr/Dam ⇒ implicit redan filtrerat
+      let chunks = [];
+      if (buildStrategy === "fastest" || buildStrategy === "manual") {
+        for (let i=0; i<relayTeams; i++) {
+          const grp = withTime.slice(i*4, i*4+4);
+          if (grp.length === 4) chunks.push(grp);
+        }
+      } else if (buildStrategy === "even") {
+        const Ts = Array.from({length: relayTeams}, ()=>[]);
+        let forward = true, i = 0;
+        for (const s of withTime) {
+          if (Ts[i].length < 4) Ts[i].push(s);
+          if (forward) { i++; if (i >= relayTeams) { i = relayTeams - 1; forward = false; } }
+          else { i--; if (i < 0) { i = 0; forward = true; } }
+          if (Ts[i]?.length === 4) {
+            const next = Ts.findIndex(t => t.length < 4);
+            if (next !== -1) i = next;
+          }
+        }
+        chunks = Ts.filter(t => t.length === 4);
+      }
+
+      const teams = chunks.map((grp, idx) => {
+        const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: s.tStr, stroke: "Frisim" }));
+        return { name: `Lag ${idx+1}`, legs, total: sum(grp.map(x=>x.t)) };
+      });
+      setGenerated({ note: null, teams });
+      return;
+    }
+
+    // Medley (4 ben)
+    if (needed.length === 4) {
+      const is50Medley = /4x50\s*medley/i.test(normStr(relayType));
+      const order = needed.slice();
+      const legLabel = (k) => labelForKey(k);
+
+      function mixOkAfterPick(currentLegs, candName) {
+        if (!requireMix) return true;
+        const g = genderOf.get(candName);
+        const dam = currentLegs.filter(L => genderOf.get(L.name) === "Dam").length + (g === "Dam" ? 1 : 0);
+        const herr = currentLegs.filter(L => genderOf.get(L.name) === "Herr").length + (g === "Herr" ? 1 : 0);
+        if (dam > 2 || herr > 2) return false;
+        const legsLeft = 4 - (currentLegs.length + 1);
+        const needDam = 2 - dam, needHerr = 2 - herr;
+        return needDam >= 0 && needHerr >= 0 && (needDam + needHerr) <= legsLeft;
+      }
+
+      if (buildStrategy === "fastest") {
+        // sorterade kandidatlistor per ben (respekterar poolSel via getTimeForPool)
+        const byLeg = {};
+        for (const leg of order) {
+          const list = pool.map(s => ({ s, t: getTimeForPool(s.nbest, leg) }))
+            .filter(x => x.t && isFinite(x.t.timeSec))
+            .map(x => ({ name: x.s.name, time: x.t.timeSec, timeStr: x.t.timeStr }));
+          byLeg[leg] = list.sort((a,b)=>a.time - b.time);
+        }
+
+        const teams = [];
+        const globallyUsed = new Set();
+
+        for (let t = 0; t < relayTeams; t++) {
+          const usedInTeam = new Set();
+          const legs = [];
+
+          for (const leg of order) {
+            const list = byLeg[leg];
+            const pickIdx = list.findIndex(c =>
+              !usedInTeam.has(c.name) &&
+              !globallyUsed.has(c.name) &&
+              (ignoreGender || mixOkAfterPick(legs, c.name))
+            );
+            if (pickIdx !== -1) {
+              const pick = list[pickIdx];
+              legs.push({ leg: legLabel(leg), name: pick.name, time: pick.time, timeStr: pick.timeStr });
+              usedInTeam.add(pick.name);
+              globallyUsed.add(pick.name);
+            } else {
+              legs.push({ leg: legLabel(leg), name: "(saknas)", time: NaN, timeStr: "" });
+            }
+          }
+
+          const total = legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0);
+          const complete = legs.every(l => isFinite(l.time));
+
+          if (complete) {
+            if (!requireMix) {
+              teams.push({ name: `Lag ${t+1}`, legs, total });
+            } else {
+              const dam = legs.filter(L => genderOf.get(L.name) === "Dam").length;
+              const herr = legs.filter(L => genderOf.get(L.name) === "Herr").length;
+              if (dam === 2 && herr === 2) teams.push({ name: `Lag ${t+1}`, legs, total });
+            }
+          } else break;
+        }
+
+        setGenerated({
+          note: (requireMix && teams.length === 0) ? "Inte tillräckligt med mix-kandidater (behöver 2 Dam + 2 Herr per lag och tider på alla ben)." : null,
+          teams
+        });
+        return;
+      }
+
+      // EVEN / MANUAL
+      const teams = Array.from({length: relayTeams}, (_,i)=>({ name:`Lag ${i+1}`, legs: [], total:0 }));
+      const teamUsed = Array.from({length: relayTeams}, ()=> new Set());
+      const usedGlobal = new Set();
+
+      for (let li = 0; li < order.length; li++) {
+        const legKey = order[li];
+        let cand = pool
+          .map(s => ({ s, t: getTimeForPool(s.nbest, legKey) }))
+          .filter(x => x.t && isFinite(x.t.timeSec) && !usedGlobal.has(x.s.name))
+          .map(x => ({ name: x.s.name, time: x.t.timeSec, timeStr: x.t.timeStr }))
+          .sort((a,b)=>a.time - b.time);
+
+        const idxs = [...Array(relayTeams).keys()];
+        if (li % 2 === 1) idxs.reverse();
+
+        for (const ti of idxs) {
+          const pickIdx = cand.findIndex(c =>
+            !teamUsed[ti].has(c.name) &&
+            (ignoreGender || mixOkAfterPick(teams[ti].legs, c.name))
+          );
+          if (pickIdx !== -1) {
+            const pick = cand.splice(pickIdx,1)[0];
+            teams[ti].legs.push({ leg: legLabel(legKey), name: pick.name, time: pick.time, timeStr: pick.timeStr });
+            teamUsed[ti].add(pick.name);
+            usedGlobal.add(pick.name);
+          } else {
+            teams[ti].legs.push({ leg: legLabel(legKey), name: "(saknas)", time: NaN, timeStr: "" });
+          }
+        }
+      }
+
+      teams.forEach(t => { t.total = t.legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0); });
+
+      // Balans (same-leg swaps)
+      const spread = (ts) => Math.max(...ts.map(t=>t.total)) - Math.min(...ts.map(t=>t.total));
+      const maxIter = 50;
+      let improved = true, iter = 0;
+
+      while (improved && iter < maxIter) {
+        improved = false; iter++;
+        let bestSwap = null;
+        const curSpread = spread(teams);
+
+        for (let legIdx = 0; legIdx < 4; legIdx++) {
+          for (let i = 0; i < teams.length; i++) {
+            for (let j = i+1; j < teams.length; j++) {
+              const A = teams[i], B = teams[j];
+              const L1 = A.legs[legIdx], L2 = B.legs[legIdx];
+              if (!isFinite(L1.time) || !isFinite(L2.time)) continue;
+
+              // Mix-begränsning — gäller ej för “Alla”
+              if (requireMix) {
+                const cnt = (legs) => ({
+                  dam: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Dam").length,
+                  herr: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Herr").length
+                });
+                const g1 = normalizeGender(bestBySwimmer[L1.name]?.gender);
+                const g2 = normalizeGender(bestBySwimmer[L2.name]?.gender);
+                const cA = cnt(A.legs), cB = cnt(B.legs);
+                const newA_dam  = cA.dam  - (g1==="Dam")  + (g2==="Dam");
+                const newA_herr = cA.herr - (g1==="Herr") + (g2==="Herr");
+                const newB_dam  = cB.dam  - (g2==="Dam")  + (g1==="Dam");
+                const newB_herr = cB.herr - (g2==="Herr") + (g1==="Herr");
+                if (newA_dam>2 || newA_herr>2 || newB_dam>2 || newB_herr>2) continue;
+              }
+
+              // inga dubbletter i lag
+              const aNames = new Set(A.legs.map(x=>x.name)); aNames.delete(L1.name);
+              const bNames = new Set(B.legs.map(x=>x.name)); bNames.delete(L2.name);
+              if (aNames.has(L2.name) || bNames.has(L1.name)) continue;
+
+              const newA = A.total - L1.time + L2.time;
+              const newB = B.total - L2.time + L1.time;
+
+              const maxOthers = teams.reduce((m,t,k)=> k===i||k===j ? m : Math.max(m, t.total), -Infinity);
+              const minOthers = teams.reduce((m,t,k)=> k===i||k===j ? m : Math.min(m, t.total), Infinity);
+              const newSpread = Math.max(maxOthers, newA, newB) - Math.min(minOthers, newA, newB);
+
+              if (newSpread + 1e-9 < (bestSwap?.spread ?? curSpread)) {
+                bestSwap = { i, j, legIdx, newA, newB, spread: newSpread };
+              }
+            }
+          }
+        }
+
+        if (bestSwap) {
+          const A = teams[bestSwap.i], B = teams[bestSwap.j];
+          const tmp = A.legs[bestSwap.legIdx];
+          A.legs[bestSwap.legIdx] = B.legs[bestSwap.legIdx];
+          B.legs[bestSwap.legIdx] = tmp;
+          A.total = bestSwap.newA; B.total = bestSwap.newB;
+          improved = true;
+        }
+      }
+
+      const finalTeams = teams.filter(t => {
+        const complete = t.legs.every(L => isFinite(L.time));
+        if (!requireMix) return complete;
+        const dam = t.legs.filter(L => normalizeGender(bestBySwimmer[L.name]?.gender) === "Dam").length;
+        const herr = t.legs.filter(L => normalizeGender(bestBySwimmer[L.name]?.gender) === "Herr").length;
+        return complete && dam === 2 && herr === 2;
+      });
+
+      setGenerated({
+        note: requireMix && finalTeams.length < relayTeams ? "Vissa lag kunde inte göras till mix (kräver 2 Dam + 2 Herr med tider på alla ben)." : null,
+        teams: finalTeams
+      });
+      return;
+    }
+
+    setGenerated({ note: "Okänd eller ej stödd lagkappstyp.", teams: [] });
+  }
+
+  // ---- UI ----
+  return (
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
+      {/* Brandad header */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 12, marginBottom: 12, padding: 12,
+        borderRadius: 12, background: "#fff", border: "1px solid #eee",
+        boxShadow: "0 1px 0 rgba(0,0,0,0.03)"
+      }}>
+        <img
+          src={sssLogo}
+          alt="Sundsvalls Simsällskap"
+          width={56}
+          height={56}
+          style={{
+            display: "block", borderRadius: 12, background: "#fff",
+            padding: 6, border: "1px solid #f0f0f0", objectFit: "contain"
+          }}
+        />
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 800, letterSpacing: 0.2 }}>
+            Lagkapp Generator för Simtävling
+          </div>
+          <div style={{ fontSize: 12, opacity: 0.75 }}>
+            Sundsvalls Simsällskap – “Klubben på hugget”
+          </div>
+        </div>
+      </div>
+
+      <p style={{ marginBottom: 12 }}>
+        1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass, bassäng, förening & ålder och visa/generera lag.
+      </p>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".csv"
+          onChange={(e)=>{
+            const f = e.target.files?.[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+              setRawText(String(ev.target?.result || ""));
+              setDefaultFileName(f.name);
+              setErrors([]); setValidated(false); setGenerated(null);
+              setValStatus({ state: "idle", message: "" });
+            };
+            reader.readAsText(f, "utf-8");
+          }}
+        />
+        <button onClick={onValidate} disabled={!rawText} style={btnStyle}>Validera fil</button>
+        {defaultFileName && (
+          <span style={{ fontSize: 12, opacity: 0.8 }}>
+            Förvald fil: <strong>{defaultFileName}</strong>
+          </span>
+        )}
+      </div>
+
+      {/* Statusrad */}
+      <div style={{ width: "100%", marginBottom: 12 }}>
+        {valStatus.state !== "idle" && (
+          <div
+            style={{
+              padding: "8px 10px",
+              borderRadius: 8,
+              fontSize: 13,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+              background:
+                valStatus.state === "success" ? "#f6ffed" :
+                valStatus.state === "error"   ? "#fff1f0" : "#f5f5f5",
+              color:
+                valStatus.state === "success" ? "#135200" :
+                valStatus.state === "error"   ? "#a8071a" : "#333",
+              border:
+                valStatus.state === "success" ? "1px solid #b7eb8f" :
+                valStatus.state === "error"   ? "1px solid #ffa39e" : "1px solid #d9d9d9",
+            }}
+          >
+            {valStatus.state === "validating" && (
+              <span
+                style={{
+                  width: 14, height: 14, border: "2px solid #999",
+                  borderTopColor: "transparent", borderRadius: "50%",
+                  display: "inline-block", animation: "spin 1s linear infinite"
+                }}
+              />
+            )}
+            <span>{valStatus.message}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Visa fel även om validated=false */}
+      {errors.length > 0 && (
+        <div style={noteBox("#fff1f0", "#a8071a")}>
+          ❌ Fel
+          <ul style={{ marginTop: 6 }}>
+            {errors.slice(0, 25).map((e, i) => (<li key={i}>{e}</li>))}
+            {errors.length > 25 && <li>…och {errors.length - 25} fler fel</li>}
+          </ul>
+        </div>
+      )}
+
+      {validated && (
+        <div style={{ marginTop: 8 }}>
+          <div>
+
+            {/* Val för lagkapp / klass / ålder / pool / förening */}
+            <div style={cardBox}>
+              <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr 1fr 2fr", gap: 12 }}>
+                <div>
+                  <label className="block" style={labelStyle}>Lagkapp</label>
+                  <select value={relayType} onChange={(e)=>{ setRelayType(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    <option value="">Välj typ…</option>
+                    {["4x50 frisim","4x100 frisim","4x200 frisim","4x50 medley","4x100 medley"]
+                      .map((t)=> <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block" style={labelStyle}>Klass</label>
+                  <select value={relayClass} onChange={(e)=>{ setRelayClass(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    {["Alla","Herr","Dam","Mix"].map((c)=> <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block" style={labelStyle}>Bassäng</label>
+                  <select value={poolSel} onChange={(e)=>{ setPoolSel(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    {["Alla","25","50"].map((p)=> <option key={p} value={p}>{p === "Alla" ? "Alla (25+50)" : `${p} m`}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block" style={labelStyle}>Åldersklasser (multi)</label>
+                  <select
+                    multiple
+                    value={selectedAges.map(String)}
+                    onChange={(e)=>{
+                      const vals = Array.from(e.target.selectedOptions).map(o=>Number(o.value));
+                      setSelectedAges(vals); setGenerated(null);
+                    }}
+                    style={{...selectStyle, height: 96}}
+                  >
+                    {availableAges.map((a)=> <option key={a} value={a}>{a} år</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block" style={labelStyle}>Förening</label>
+                  <select value={clubSel} onChange={(e)=>{ setClubSel(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    {clubs.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              {/* Antal lagkapper + strategi */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginTop: 12 }}>
+                <div>
+                  <label className="block" style={labelStyle}>Antal lagkapper</label>
+                  <select value={relayTeams} onChange={(e)=>{ setRelayTeams(Number(e.target.value)); setGenerated(null); }} style={selectStyle}>
+                    {[1,2,3,4,5].map(n=> <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block" style={labelStyle}>Strategi</label>
+                  <select value={buildStrategy} onChange={(e)=>{ setBuildStrategy(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    <option value="manual">Manuellt urval</option>
+                    <option value="fastest">Snabbaste laget</option>
+                    <option value="even">Jämna lag</option>
+                  </select>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <button
+                  style={btnStyle}
+                  onClick={() => {
+                    const all = new Set(filteredSwimmers.map(s => s.name));
+                    setSelectedSwimmers(all);
+                    setShowSwimmersBox(true);
+                  }}
+                  disabled={!relayType}
+                  title={!relayType ? "Välj lagkapp" : "Visa filtrerade simmare"}
+                >
+                  Visa alla simmare
+                </button>
+
+                <button
+                  style={btnStyle}
+                  onClick={generateTeams}
+                  disabled={!relayType}
+                  title="Generera lagkapper enligt vald strategi"
+                >
+                  Generera lag
+                </button>
+
+                {reqKeysBase.length > 0 && (
+                  <span style={{ fontSize: 12, opacity: 0.8 }}>
+                    Visar ben: {reqKeysBase.map(labelForKey).join(', ')} • Antal lag: {relayTeams} • Strategi: {{
+                      fastest: 'Snabbaste', manual: 'Manuellt', even: 'Jämna'
+                    }[buildStrategy]} • Bassäng: {poolSel === "Alla" ? "25+50" : `${poolSel} m`} • Klass: {relayClass}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {showSwimmersBox && (
+              <div style={{ ...cardBox, marginTop: 12 }}>
+                <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
+                  Alla simmare förvalda – klicka bort de som inte deltar. <br/>
+                  <strong>Tips:</strong> Klicka på en tid eller “(saknas)” för att <em>redigera</em>. Enter = spara, Esc = avbryt, tomt = ta bort.
+                </div>
+
+                {/* Knappar: markera/avmarkera alla */}
+                <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                  <button style={btnStyle} onClick={selectAllVisible} title="Markera alla synliga">Markera alla</button>
+                  <button style={btnSubtle} onClick={clearAllSelected} title="Avmarkera alla">Avmarkera alla</button>
+                </div>
+
+                <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
+                  <table className="min-w-full border-collapse">
+                    <thead>
+                      <tr>
+                        <th className="border px-2 py-1 text-left">Välj</th>
+                        <th className="border px-2 py-1 text-left">Namn</th>
+                        <th className="border px-2 py-1 text-left">Kön</th>
+                        <th className="border px-2 py-1 text-left">Ålder</th>
+                        {reqKeysBase.map((k)=> (
+                          <th key={k} className="border px-2 py-1 text-left">
+                            {labelForKey(k)}{poolSel!=="Alla" ? ` (${poolSel}m)` : ""}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredSwimmers.map(({ name, gender, age, nbest }) => {
+                        const g = normalizeGender(gender);
+                        return (
+                          <tr key={name}>
+                            <td className="border px-2 py-1">
+                              <input type="checkbox" checked={selectedSwimmers.has(name)} onChange={()=>toggleSelect(name)} />
+                            </td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
+                            {reqKeysBase.map((baseKey)=> {
+                              const cell = getTimeForPool(nbest, baseKey);
+                              const isEditing = editing && editing.name === name && editing.key === baseKey;
+                              const display = cell?.timeStr || "";
+                              const manual = !!cell?.manual;
+
+                              return (
+                                <td key={baseKey} className="border px-2 py-1 whitespace-nowrap">
+                                  {isEditing ? (
+                                    <input
+                                      autoFocus
+                                      type="text"
+                                      value={editing.value}
+                                      onChange={(e)=> setEditing(ed => ({ ...ed, value: e.target.value }))}
+                                      onBlur={() => {
+                                        const ok = updateTime(name, baseKey, editing.value);
+                                        if (!ok) return;
+                                        setEditing(null);
+                                      }}
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter") {
+                                          const ok = updateTime(name, baseKey, editing.value);
+                                          if (ok) setEditing(null);
+                                        } else if (e.key === "Escape") {
+                                          setEditing(null);
+                                        }
+                                      }}
+                                      placeholder="mm:ss.hh eller ss.hh"
+                                      style={{ border: "1px solid #bbb", borderRadius: 6, padding: "4px 6px", minWidth: 90 }}
+                                    />
+                                  ) : (
+                                    <span
+                                      onClick={() => setEditing({ name, key: baseKey, value: display || "" })}
+                                      title="Klicka för att redigera"
+                                      style={{
+                                        cursor: "pointer",
+                                        fontStyle: manual ? "italic" : "normal",
+                                        color: manual ? "#1d39c4" : "inherit",
+                                      }}
+                                    >
+                                      {display || <span style={{ opacity: 0.5 }}>(saknas)</span>}
+                                      {manual && <span title="Manuellt satt tid"> *</span>}
+                                    </span>
+                                  )}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+                  Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
+                </div>
+              </div>
+            )}
+
+            {generated && (
+              <div
+                style={{
+                  ...cardBox,
+                  marginTop: 12,
+                  position: "relative",
+                  overflow: "hidden",
+                  backgroundImage: `url(${sssLogo})`,
+                  backgroundRepeat: "no-repeat",
+                  backgroundPosition: "center 30%",
+                  backgroundSize: "min(35vw, 280px)",
+                  backgroundBlendMode: "soft-light",
+                  isolation: "isolate"
+                }}
+              >
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    background: isDark ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.75)",
+                    zIndex: 0
+                  }}
+                />
+                <div style={{ position: "relative", zIndex: 1 }}>
+                  <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Föreslagna lag</h3>
+                  {generated.note && <div style={noteBox("#fffbe6","#ad6800")}>⚠ {generated.note}</div>}
+                  {generated.teams.length > 0 ? generated.teams.map((team, idx) => (
+                    <div key={idx} style={{ marginBottom: 12 }}>
+                      <div style={{ fontWeight: 700, marginBottom: 6 }}>
+                        {team.name} — Total: {secondsToTimeStr(team.total)}
+                      </div>
+                      <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6, background: "#fff" }}>
+                        <thead>
+                          <tr>
+                            <th className="border px-2 py-1 text-left">Sträcka</th>
+                            <th className="border px-2 py-1 text-left">Simmare</th>
+                            <th className="border px-2 py-1 text-left">Tid</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {team.legs.map((L, i) => (
+                            <tr key={i}>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )) : <div style={{ fontSize: 14, opacity: 0.8 }}>Inga kompletta lag kunde genereras.</div>}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ====== Tema & UI ====== */
+const THEME = {
+  primary: "#f4c21f",
+  primaryText: "#111",
+  border: "#e5e5e5",
+};
+
+const btnStyle = {
+  border: `1px solid ${THEME.border}`,
+  background: THEME.primary,
+  color: THEME.primaryText,
+  padding: "8px 12px",
+  borderRadius: 8,
+  cursor: "pointer",
+};
+
+const btnSubtle = {
+  border: `1px solid ${THEME.border}`,
+  background: "#fff",
+  color: "#111",
+  padding: "8px 12px",
+  borderRadius: 8,
+  cursor: "pointer",
+};
+
+const selectStyle = { border: `1px solid ${THEME.border}`, padding: 8, borderRadius: 8, width: "100%" };
+const labelStyle  = { fontSize: 12, opacity: 0.8, marginBottom: 4 };
+const cardBox     = { border: `1px solid ${THEME.border}`, borderRadius: 12, padding: 12, background: "#fafafa" };
+
+function noteBox(bg, color) {
+  return { background: bg, color, border: `1px solid ${color}33`, padding: 12, borderRadius: 8, marginTop: 8 };
+}

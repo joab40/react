@@ -2,57 +2,72 @@ import { useMemo, useRef, useState, useEffect } from "react";
 import sssLogoLight from "./assets/sss_logga_no_year.png";
 import sssLogoDark from "./assets/sss_logga_no_year_dark.png";
 
-/** Förladdning av default-CSV (Vite 5/6-kompatibel):
- * Letar upp första .csv-filen i samma katalog som App.jsx och läser in dess råtext.
- */
-const allCsvFiles = import.meta.glob("./*.csv", { query: "?raw", import: "default", eager: true });
+/** Ladda alla CSV i samma katalog som App.jsx (Vite 5/6-kompatibel) */
+const allCsvFiles = import.meta.glob("./*.csv", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+const allCsvIndex = Object.keys(allCsvFiles).map((p) => ({
+  path: p,
+  name: p.split("/").pop() || p,
+}));
+
+// Förvald (första hittade .csv)
 let defaultCsvPath = null;
 let defaultCsvText = null;
-for (const path of Object.keys(allCsvFiles)) {
-  if (path.toLowerCase().endsWith(".csv")) {
-    defaultCsvPath = path;
-    defaultCsvText = allCsvFiles[path];
+for (const p of Object.keys(allCsvFiles)) {
+  if (p.toLowerCase().endsWith(".csv")) {
+    defaultCsvPath = p;
+    defaultCsvText = allCsvFiles[p];
     break;
   }
 }
 
 export default function App() {
-  // Data / validering
+  // --- Data / validering ---
   const [rawText, setRawText] = useState("");
   const [rows, setRows] = useState([]);
   const [headers, setHeaders] = useState([]);
   const [errors, setErrors] = useState([]);
   const [validated, setValidated] = useState(false);
+
+  // bestBySwimmer[name] = { gender, club, age, nbest: { "<event>_<25|50>": {timeSec, timeStr, manual?} } }
   const [bestBySwimmer, setBestBySwimmer] = useState({});
   const [summary, setSummary] = useState(null);
 
-  // UI-val
-  const [relayType, setRelayType] = useState("");       // 4x50 frisim, 4x100 frisim, 4x200 frisim, 4x50 medley, ...
-  const [relayClass, setRelayClass] = useState("");     // Herr | Dam | Mix
+  // --- UI-val ---
+  const [relayType, setRelayType] = useState("");       // 4x25/4x50/4x100/4x200 frisim, 4x50/4x100 medley
+  const [relayClass, setRelayClass] = useState("Alla"); // Herr | Dam | Mix | Alla
   const [selectedAges, setSelectedAges] = useState([]); // multi-select ages
-  const [selectedClub, setSelectedClub] = useState(""); // föreningsfilter
+
+  // Bassäng autodetekteras vid validering: "25" | "50" | "Alla"
+  const [poolSel, setPoolSel] = useState("Alla");
+
+  // Klubbfilter
+  const [clubSel, setClubSel] = useState("Sundsvalls SS");
+  const [clubs, setClubs] = useState(["Alla föreningar", "Sundsvalls SS"]);
+
+  // Lista / generering
   const [showSwimmersBox, setShowSwimmersBox] = useState(false);
   const [selectedSwimmers, setSelectedSwimmers] = useState(new Set());
-
-  // Antal lag + strategi
   const [relayTeams, setRelayTeams] = useState(1);              // 1..5
-  const [buildStrategy, setBuildStrategy] = useState("manual"); // 'manual' | 'fastest' | 'even'
-
-  // Genererade lag
+  const [buildStrategy, setBuildStrategy] = useState("manual"); // manual | fastest | even
   const [generated, setGenerated] = useState(null);
 
-  // Statusrad för validering
-  const [valStatus, setValStatus] = useState({ state: "idle", message: "" });
-  // state: "idle" | "validating" | "success" | "error"
+  // Inline-edit
+  const [editing, setEditing] = useState(null); // { name, key, value }
 
-  // Default-filnamn (visning)
-  const [defaultFileName, setDefaultFileName] = useState("");
+  // Statusrad
+  const [valStatus, setValStatus] = useState({ state: "idle", message: "" });
+
+  // Visning av aktivt filnamn
+  const [activeFileName, setActiveFileName] = useState("");
+  const [rootPick, setRootPick] = useState(allCsvIndex[0]?.path || "");
   const fileRef = useRef(null);
 
-  // Inline-edit state
-  const [editing, setEditing] = useState(null); // { name, key, value } | null
-
-  // Dark mode – håll koll på systemets tema och uppdatera dynamiskt
+  // Dark mode
   const [isDark, setIsDark] = useState(() =>
     typeof window !== "undefined" && window.matchMedia
       ? window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -71,32 +86,85 @@ export default function App() {
   }, []);
   const sssLogo = isDark ? sssLogoDark : sssLogoLight;
 
-  // Läs in första .csv i katalogen – utan att validera automatiskt
+  // Läs in första .csv (utan att auto-validera)
   useEffect(() => {
     if (defaultCsvText) {
       setRawText(defaultCsvText);
       const parts = (defaultCsvPath || "").split("/");
-      setDefaultFileName(parts[parts.length - 1] || "");
+      setActiveFileName(parts[parts.length - 1] || "");
     }
   }, []);
 
-  // Injicera enkel @keyframes för spinnaren (en gång)
+  // Inject spinner CSS
   useEffect(() => {
     const id = "app-spin-keyframes";
     if (!document.getElementById(id)) {
       const style = document.createElement("style");
       style.id = id;
-      style.innerHTML = `
-@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-      `.trim();
+      style.innerHTML = `@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`;
       document.head.appendChild(style);
     }
   }, []);
 
+  // === Hjälpare för fil-laddning (knapparna 25m / 50m / root-dropdown / egen uppladdning) ===
+  function resetStateForNewFile(filename) {
+    setActiveFileName(filename || "");
+    setErrors([]);
+    setValidated(false);
+    setBestBySwimmer({});
+    setSummary(null);
+    setShowSwimmersBox(false);
+    setSelectedSwimmers(new Set());
+    setGenerated(null);
+    setEditing(null);
+    setValStatus({ state: "idle", message: "" });
+  }
+
+  function loadCsvTextAndValidate(text, filename) {
+    resetStateForNewFile(filename);
+    setRawText(text);
+    // Säkerställ att onValidate körs efter state uppdaterats
+    setTimeout(() => onValidate(), 0);
+  }
+
+  function findFirstCsvByToken(token /* "25m" | "50m" */) {
+    const low = String(token).toLowerCase();
+    // välj första som innehåller token + slutar på .csv
+    for (const { path, name } of allCsvIndex) {
+      const n = name.toLowerCase();
+      if (n.endsWith(".csv") && n.includes(low)) return path;
+    }
+    return null;
+  }
+
+  function handleLoadPreset(which /* "25m"|"50m" */) {
+    const path = findFirstCsvByToken(which);
+    if (!path) {
+      setValStatus({ state: "error", message: `Hittar ingen CSV i root som matchar "${which}".` });
+      return;
+    }
+    const text = allCsvFiles[path];
+    if (typeof text !== "string") {
+      setValStatus({ state: "error", message: "Kunde inte läsa förvald CSV." });
+      return;
+    }
+    loadCsvTextAndValidate(text, path.split("/").pop() || path);
+  }
+
+  function handleLoadRootSelected() {
+    if (!rootPick) return;
+    const text = allCsvFiles[rootPick];
+    if (typeof text !== "string") {
+      setValStatus({ state: "error", message: "Kunde inte läsa vald CSV." });
+      return;
+    }
+    loadCsvTextAndValidate(text, rootPick.split("/").pop() || rootPick);
+  }
+
   // ---- CSV/parse helpers ----
   function detectDelimiter(sample) {
     const sc = (sample.match(/;/g) || []).length;
-       const cc = (sample.match(/,/g) || []).length;
+    const cc = (sample.match(/,/g) || []).length;
     return sc >= cc ? ";" : ",";
   }
 
@@ -117,6 +185,7 @@ export default function App() {
     const delimiter = detectDelimiter(text.slice(0, 2000));
     const lines = text.replace(/\r\n?/g, "\n").split("\n");
 
+    // hitta header-rad
     let headerIdx = -1;
     for (let i = 0; i < lines.length; i++) {
       const L = lines[i];
@@ -131,7 +200,6 @@ export default function App() {
     const body = allLines.slice(1)
       .map((ln) => smartSplit(ln, delimiter))
       .filter((cols) => cols.some((c) => (c || "").trim().length > 0))
-      // filtrera bort insprängda rubrikrader i body
       .filter((cols) => {
         let headerHits = 0; for (const c of cols) if (headerSet.has((c || "").trim())) headerHits++;
         return headerHits < 3 && (cols[0] || "").trim() !== "Placering";
@@ -161,16 +229,17 @@ export default function App() {
     return null;
   }
 
-  // Normalisering av gren till nycklar vi kan slå upp
+  // Normalisering av text
   function normStr(s) {
     return String(s||"").toLowerCase()
       .replaceAll("å","a").replaceAll("ä","a").replaceAll("ö","o")
       .replace(/\s+/g," ").trim();
   }
 
-  // Stöd för 50 rygg/bröst/fjäril + frisim
+  // Event-nycklar (inkl. 25 frisim)
   function normalizeEvent(e) {
     const s = normStr(e).replace(/meter|m\.|m /g, "m ").replace(/\s+/g, " ");
+    const has25  = /(^|\s)25\s*m/.test(s)  || /\b25m\b/.test(s);
     const has50  = /(^|\s)50\s*m/.test(s)  || /\b50m\b/.test(s);
     const has100 = /(^|\s)100\s*m/.test(s) || /\b100m\b/.test(s);
     const has200 = /(^|\s)200\s*m/.test(s) || /\b200m\b/.test(s);
@@ -180,7 +249,7 @@ export default function App() {
     const isBreast = /bröst|brost|breast/.test(s);
     const isFly    = /fjäril|fjaril|butterfly/.test(s);
 
-    // 50-distans för alla medley-ben
+    if (has25  && isFree)   return "frisim_25";
     if (has50  && isFree)   return "frisim_50";
     if (has50  && isBack)   return "rygg_50";
     if (has50  && isBreast) return "brost_50";
@@ -222,6 +291,41 @@ export default function App() {
     return "";
   }
 
+  // Vilka tider behövs beroende på lagkapp (event-keys utan pool)
+  function requiredEventKeysBase(rt) {
+    const s = normStr(rt);
+    if (/4x25\s*frisim/.test(s))  return ["frisim_25"];
+    if (/4x50\s*frisim/.test(s))  return ["frisim_50"];
+    if (/4x100\s*frisim/.test(s)) return ["frisim_100"];
+    if (/4x200\s*frisim/.test(s)) return ["frisim_200"];
+    if (/4x50\s*medley/.test(s))  return ["rygg_50","brost_50","fjaril_50","frisim_50"];
+    if (/4x100\s*medley/.test(s)) return ["rygg_100","brost_100","fjaril_100","frisim_100"];
+    return [];
+  }
+
+  const reqKeysBase = useMemo(() => requiredEventKeysBase(relayType), [relayType]);
+
+  function labelForKey(baseKey) {
+    const map = {
+      frisim_25:"25 frisim",
+      frisim_50:"50 frisim", frisim_100:"100 frisim", frisim_200:"200 frisim",
+      rygg_50:"50 rygg", rygg_100:"100 rygg",
+      brost_50:"50 bröst", brost_100:"100 bröst",
+      fjaril_50:"50 fjäril", fjaril_100:"100 fjäril",
+    };
+    return map[baseKey] || baseKey;
+  }
+
+  // Hämta rätt tid givet autodetekterad poolSel (Alla ⇒ prefer 50, annars 25)
+  function getTimeForPool(nbest, baseKey) {
+    if (!nbest) return null;
+    const p50 = nbest[`${baseKey}_50`];
+    const p25 = nbest[`${baseKey}_25`];
+    if (poolSel === "50") return p50 || null;
+    if (poolSel === "25") return p25 || null;
+    return p50 || p25 || null;
+  }
+
   // ---- Validering ----
   function onValidate() {
     setErrors([]);
@@ -232,11 +336,10 @@ export default function App() {
     setSelectedSwimmers(new Set());
     setGenerated(null);
     setEditing(null);
-    setSelectedClub("");
 
     if (!rawText) {
-      setValStatus({ state: "error", message: "Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx." });
-      setErrors(["Ingen fil inläst. Ladda upp eller lägg .csv bredvid App.jsx."]);
+      setValStatus({ state: "error", message: "Ingen fil inläst. Välj 25m/50m, ladda vald CSV i root eller ladda upp egen." });
+      setErrors(["Ingen fil inläst."]);
       return;
     }
 
@@ -258,9 +361,11 @@ export default function App() {
       const timeCol   = pickColumn(hdrs, ["Tid","Resultat","Sluttid"]);
       const genderCol = pickColumn(hdrs, ["Kön","Kon","Gender","K"]);
       const ageCol    = pickColumn(hdrs, ["Ålder vid loppet","Alder vid loppet","Ålder idag","Alder idag","Ålder","Alder"]);
-      const bornCol   = pickColumn(hdrs, ["Född","Fodd","Födelseår","Fodelsear"]);
-      const dateCol   = pickColumn(hdrs, ["Datum","Tävlingsdatum","Tavlingsdatum"]);
-      const clubCol   = pickColumn(hdrs, ["Förening","Forening","Klubb","Förening/Klubb","Club","Team"]);
+      const bornCol   = pickColumn(hdrs, ["Född","Fodd","Födelseår","Fodelsear","Födelsedatum","Fodelsedatum"]);
+      const dateCol   = pickColumn(hdrs, ["Datum","Tävlingsdatum","Tavlingsdatum","Date"]);
+      const poolCol   = pickColumn(hdrs, ["Bassäng","Bassang","Pool","Pool length"]);
+      const clubCol   = pickColumn(hdrs, ["Förening","Forening","Klubb","Club","Team"]);
+      const meetCol   = pickColumn(hdrs, ["Tävling","Tavling","Meet","Competition"]);
 
       const missing = [];
       if (!nameCol)  missing.push("Namn/Simidrottare");
@@ -273,88 +378,113 @@ export default function App() {
         return;
       }
 
-      const CURRENT_YEAR = new Date().getFullYear(); // t.ex. 2025
-      const best = {}; // name -> { gender, age, club, nbest: { key -> {timeSec,timeStr,manual?} } }
+      // Säsongsår: senaste årtal i Datum-kolumnen om möjligt, annars 2025
+      let seasonYear = 2025;
+      if (dateCol) {
+        const yrs = [];
+        for (const r of rows) {
+          const d = String(r[dateCol] || "");
+          const m = d.match(/(20\d{2})/);
+          if (m) yrs.push(+m[1]);
+        }
+        if (yrs.length) seasonYear = Math.max(...yrs);
+      }
+
+      const best = {}; // name -> { gender, club, age, nbest }
+      const clubSet = new Set();
+      const seenPools = new Set(); // "25" | "50"
 
       rows.forEach((r) => {
         const name = (r[nameCol]||"").trim();
         const gren = (r[eventCol]||"").trim();
         const tidRaw = (r[timeCol]||"").trim();
         const konRaw = genderCol ? (r[genderCol]||"").trim() : "";
-        const clubRaw = clubCol ? (r[clubCol] || "").trim() : "";
+        const clubRaw = clubCol ? (r[clubCol]||"").trim() : "";
 
-        if (!name && !gren && !tidRaw) return; // tom rad
+        if (!name && !gren && !tidRaw) return;
+
         const sec = parseTimeToSeconds(tidRaw);
 
-        // Ålder enligt "ålder under innevarande år" (t.ex. 2010 -> 15 år under 2025)
-        let alder = ageCol ? Number(String(r[ageCol]).replace(/[^0-9]/g, "")) : NaN;
-        const bornYear = bornCol ? Number(String(r[bornCol]).slice(0,4)) : NaN;
-        const dateYear = dateCol ? Number(String(r[dateCol]).slice(0,4)) : NaN;
+        // Pooldetektering
+        const poolRaw = poolCol ? String(r[poolCol] || "").trim().toLowerCase() : "";
+        const tavlingRaw = String(meetCol ? (r[meetCol] || "") : "").toLowerCase();
+        const grenRaw = String(gren || "").toLowerCase();
 
-        if (isFinite(bornYear)) {
-          alder = CURRENT_YEAR - bornYear;
-        } else if (!isFinite(alder) && isFinite(dateYear)) {
-          // fallback om bara datum finns – mindre viktigt i praktiken
-          alder = dateYear - (isFinite(bornYear) ? bornYear : dateYear);
-        }
+        let poolType = "";
+        if (poolRaw.includes("25")) poolType = "25";
+        else if (poolRaw.includes("50")) poolType = "50";
+        else if (/\(25m\)/i.test(tavlingRaw) || /\b25m\b/.test(tavlingRaw) || /\(25m\)/i.test(grenRaw) || /\b25m\b/.test(grenRaw)) poolType = "25";
+        else if (/\(50m\)/i.test(tavlingRaw) || /\b50m\b/.test(tavlingRaw) || /\(50m\)/i.test(grenRaw) || /\b50m\b/.test(grenRaw)) poolType = "50";
+        if (poolType) seenPools.add(poolType);
 
-        if (!best[name]) best[name] = { gender: konRaw || "", age: isFinite(alder)?alder:"", club: clubRaw || "", nbest: {} };
-
-        const nkey = normalizeEvent(gren);
-        if (name && nkey && isFinite(sec)) {
-          if (!best[name].nbest[nkey] || sec < best[name].nbest[nkey].timeSec) {
-            best[name].nbest[nkey] = { timeSec: sec, timeStr: secondsToTimeStr(sec) };
+        // Ålder/klass: säsongsår − födelseår (Linus 2010 ⇒ 15 år 2025)
+        let classAge = "";
+        let bornYear = NaN;
+        const bornField = String(r[bornCol] || "");
+        const mY = bornField.match(/(\d{4})/);
+        if (mY) bornYear = +mY[1];
+        if (!isFinite(bornYear) && ageCol) {
+          const ageAtRace = Number(String(r[ageCol]).replace(/[^0-9]/g, ""));
+          if (isFinite(ageAtRace)) {
+            const raceYearMatch = String(r[dateCol] || "").match(/(20\d{2})/);
+            const raceYear = raceYearMatch ? +raceYearMatch[1] : seasonYear;
+            bornYear = raceYear - ageAtRace;
           }
         }
+        if (isFinite(bornYear)) classAge = seasonYear - bornYear;
+
+        if (!best[name]) best[name] = { gender: konRaw || "", club: clubRaw || "", age: Number.isFinite(classAge)?classAge:"", nbest: {} };
+
+        if (clubRaw) {
+          clubSet.add(clubRaw);
+          if (!best[name].club) best[name].club = clubRaw;
+        }
+
+        const baseKey = normalizeEvent(gren);
+        if (name && baseKey && isFinite(sec) && (poolType === "25" || poolType === "50")) {
+          const fullKey = `${baseKey}_${poolType}`;
+          const prev = best[name].nbest[fullKey];
+          if (!prev || sec < prev.timeSec) {
+            best[name].nbest[fullKey] = { timeSec: sec, timeStr: secondsToTimeStr(sec) };
+          }
+        }
+
         if (!best[name].gender && konRaw) best[name].gender = konRaw;
-        if (!best[name].age && isFinite(alder)) best[name].age = alder;
-        if (!best[name].club && clubRaw) best[name].club = clubRaw;
+        if (!best[name].age && Number.isFinite(classAge)) best[name].age = classAge;
       });
 
-      // Summering
+      // Summering & klubbar
       const genders = Object.values(best).map((b) => normalizeGender(b.gender));
       const dam = genders.filter((g) => g === "Dam").length;
       const herr = genders.filter((g) => g === "Herr").length;
 
+      const sortedClubs = Array.from(clubSet).sort((a,b)=>a.localeCompare(b,"sv"));
+      const defaultClub = sortedClubs.includes("Sundsvalls SS") ? "Sundsvalls SS" : (sortedClubs[0] || "Alla föreningar");
+      const clubList = ["Alla föreningar", ...sortedClubs];
+
+      // Auto-sätt bassänglängd
+      const detectedPool = seenPools.size === 1 ? Array.from(seenPools)[0] : "Alla";
+      setPoolSel(detectedPool);
+
       setBestBySwimmer(best);
       setValidated(true);
-      const sumObj = { swimmers: Object.keys(best).length, dam, herr };
+      setClubs(clubList);
+      setClubSel(defaultClub);
+      const sumObj = { swimmers: Object.keys(best).length, dam, herr, seasonYear };
       setSummary(sumObj);
-      setValStatus({ state: "success", message: `Validering klar – ${sumObj.swimmers} simmare (Dam ${sumObj.dam} / Herr ${sumObj.herr})` });
+      setValStatus({ state: "success", message: `Validering klar – ${sumObj.swimmers} simmare (Dam ${sumObj.dam} / Herr ${sumObj.herr}) • Säsong ${sumObj.seasonYear}` });
     } catch (e) {
       setValStatus({ state: "error", message: "Ett oväntat fel inträffade under valideringen. Se konsolen." });
       console.error(e);
     }
   }
 
-  // Ålderslista (multi-select)
+  // Ålderslista (multi)
   const availableAges = useMemo(() => {
     const s = new Set();
     Object.values(bestBySwimmer).forEach((b) => { if (b.age !== "" && Number.isFinite(b.age)) s.add(b.age); });
     return Array.from(s).sort((a,b)=>a-b);
   }, [bestBySwimmer]);
-
-  // Föreningslista
-  const availableClubs = useMemo(() => {
-    const s = new Set();
-    Object.values(bestBySwimmer).forEach((b) => {
-      const c = (b.club || "").trim();
-      if (c) s.add(c);
-    });
-    return Array.from(s).sort((a,b)=>a.localeCompare(b,"sv"));
-  }, [bestBySwimmer]);
-
-  // Vilka tider ska visas beroende på lagkapp
-  function requiredEventKeys(rt) {
-    const s = normStr(rt);
-    if (/4x50\s*frisim/.test(s))  return ["frisim_50"];
-    if (/4x100\s*frisim/.test(s)) return ["frisim_100"];
-    if (/4x200\s*frisim/.test(s)) return ["frisim_200"];
-    if (/4x50\s*medley/.test(s))  return ["rygg_50","brost_50","fjaril_50","frisim_50"];
-    if (/4x100\s*medley/.test(s)) return ["rygg_100","brost_100","fjaril_100","frisim_100"];
-    return [];
-  }
-  const reqKeys = useMemo(() => requiredEventKeys(relayType), [relayType]);
 
   // Filtrering + sortering i listan
   const filteredSwimmers = useMemo(() => {
@@ -363,50 +493,37 @@ export default function App() {
 
     let arr = list.filter(({ gender, age, club }) => {
       const g = normalizeGender(gender);
-      const passClass = !relayClass || relayClass === "Mix" || g === relayClass;
+      const passClass = relayClass === "Alla" || relayClass === "Mix" || (!relayClass) || g === relayClass;
       const passAge = ages.size === 0 || (Number.isFinite(age) && ages.has(age));
-      const passClub = !selectedClub || (club || "").trim() === selectedClub;
+      const passClub = clubSel === "Alla föreningar" || (club || "") === clubSel;
       return passClass && passAge && passClub;
     });
 
-    if (buildStrategy === "fastest" && reqKeys.length > 0) {
+    if (buildStrategy === "fastest" && reqKeysBase.length > 0) {
       arr.sort((a, b) => {
-        const aAvail = reqKeys.filter(k => a.nbest?.[k]?.timeSec != null).length;
-        const bAvail = reqKeys.filter(k => b.nbest?.[k]?.timeSec != null).length;
+        const aAvail = reqKeysBase.filter(k => !!getTimeForPool(a.nbest, k)).length;
+        const bAvail = reqKeysBase.filter(k => !!getTimeForPool(b.nbest, k)).length;
         if (aAvail !== bAvail) return bAvail - aAvail;
+
         const big = 1e9;
-        const aSum = reqKeys.reduce((s, k) => s + (a.nbest?.[k]?.timeSec ?? big), 0);
-        const bSum = reqKeys.reduce((s, k) => s + (b.nbest?.[k]?.timeSec ?? big), 0);
+        const aSum = reqKeysBase.reduce((s, k) => s + (getTimeForPool(a.nbest, k)?.timeSec ?? big), 0);
+        const bSum = reqKeysBase.reduce((s, k) => s + (getTimeForPool(b.nbest, k)?.timeSec ?? big), 0);
         if (aSum !== bSum) return aSum - bSum;
+
         return a.name.localeCompare(b.name, "sv");
       });
     } else {
       arr.sort((a,b)=>a.name.localeCompare(b.name, "sv"));
     }
     return arr;
-  }, [bestBySwimmer, relayClass, selectedAges, selectedClub, buildStrategy, reqKeys]);
+  }, [bestBySwimmer, relayClass, selectedAges, buildStrategy, reqKeysBase, clubSel, poolSel]);
 
-  // Auto-bocka alla när rutan visas eller listan uppdateras
+  // Auto-bocka synliga när rutan öppnas
   useEffect(() => {
     if (!showSwimmersBox) return;
     const all = new Set(filteredSwimmers.map(s => s.name));
     setSelectedSwimmers(all);
   }, [showSwimmersBox, filteredSwimmers]);
-
-  function labelForKey(k) {
-    switch (k) {
-      case "frisim_50":  return "50 frisim";
-      case "frisim_100": return "100 frisim";
-      case "frisim_200": return "200 frisim";
-      case "rygg_50":    return "50 rygg";
-      case "rygg_100":   return "100 rygg";
-      case "brost_50":   return "50 bröst";
-      case "brost_100":  return "100 bröst";
-      case "fjaril_50":  return "50 fjäril";
-      case "fjaril_100": return "100 fjäril";
-      default: return k;
-    }
-  }
 
   function toggleSelect(name) {
     setSelectedSwimmers(prev => {
@@ -415,46 +532,52 @@ export default function App() {
       return n;
     });
   }
-
-  // Markera/avmarkera
   function selectAllVisible() { setSelectedSwimmers(new Set(filteredSwimmers.map(s => s.name))); }
   function clearAllSelected() { setSelectedSwimmers(new Set()); }
 
-  // Uppdatera/ta bort tid (inline)
-  function updateTime(swimmerName, key, newTimeStr) {
+  // Inline-uppdatering (skriver mot auto-pool; “Alla” ⇒ prefer 50)
+  function updateTime(swimmerName, baseKey, newTimeStr) {
+    const current = bestBySwimmer[swimmerName]?.nbest || {};
+    const targetPool =
+      poolSel === "25" ? "25" :
+      poolSel === "50" ? "50" :
+      (current[`${baseKey}_50`] ? "50" : "25");
+
+    const fullKey = `${baseKey}_${targetPool}`;
     const trimmed = String(newTimeStr ?? "").trim();
+
     if (!trimmed) {
       setBestBySwimmer(prev => {
         const copy = { ...prev };
         const s = copy[swimmerName];
         if (!s) return prev;
         const nbest = { ...(s.nbest || {}) };
-        if (nbest[key]) {
-          delete nbest[key];
+        if (nbest[fullKey]) {
+          delete nbest[fullKey];
           copy[swimmerName] = { ...s, nbest };
         }
         return copy;
       });
       return true;
     }
+
     const sec = parseTimeToSeconds(trimmed);
     if (!isFinite(sec)) return false;
     setBestBySwimmer(prev => {
       const copy = { ...prev };
-      const s = copy[swimmerName] || { gender: "", age: "", club: "", nbest: {} };
+      const s = copy[swimmerName] || { gender: "", club: "", age: "", nbest: {} };
       const nbest = { ...(s.nbest || {}) };
-      nbest[key] = { timeSec: sec, timeStr: secondsToTimeStr(sec), manual: true };
+      nbest[fullKey] = { timeSec: sec, timeStr: secondsToTimeStr(sec), manual: true };
       copy[swimmerName] = { ...s, nbest };
       return copy;
     });
     return true;
   }
 
-  // ---- Laggenerering med MIX-regel + bockningskrav ----
+  // ---- Laggenerering ----
   function generateTeams() {
     if (!relayType) { setGenerated(null); return; }
 
-    // Använd alltid endast bockade om några finns, annars alla filtrerade
     const pool = (selectedSwimmers.size > 0)
       ? filteredSwimmers.filter(s => selectedSwimmers.has(s.name))
       : filteredSwimmers.slice();
@@ -462,19 +585,20 @@ export default function App() {
     if (pool.length === 0) { setGenerated({ note: "Inga simmare i urvalet.", teams: [] }); return; }
 
     const sum = (arr) => arr.reduce((a,b)=>a+b,0);
-    const toStr = (sec) => secondsToTimeStr(sec);
 
     const requireMix = relayClass === "Mix";
+    const ignoreGender = relayClass === "Alla";
     const genderOf = new Map(pool.map(p => [p.name, normalizeGender(p.gender)]));
 
-    // FRISIM (en distans)
-    if (reqKeys.length === 1 && reqKeys[0].startsWith("frisim")) {
-      const key = reqKeys[0];
-      const withTime = pool
-        .filter(p => p.nbest?.[key]?.timeSec != null)
-        .map(p => ({ ...p, t: p.nbest[key].timeSec }));
-      if (withTime.length < 4) { setGenerated({ note: "Färre än 4 med giltig frisimtid.", teams: [] }); return; }
+    const needed = reqKeysBase.slice();
 
+    // Enben (alla frisim-varianter inkl. 25)
+    if (needed.length === 1 && needed[0].startsWith("frisim")) {
+      const base = needed[0];
+      const withTime = pool.map(p => ({ p, t: getTimeForPool(p.nbest, base) }))
+        .filter(x => x.t && isFinite(x.t.timeSec))
+        .map(x => ({ ...x.p, t: x.t.timeSec, tStr: x.t.timeStr }));
+      if (withTime.length < 4) { setGenerated({ note: "Färre än 4 med giltig tid.", teams: [] }); return; }
       withTime.sort((a,b)=>a.t - b.t);
 
       if (requireMix) {
@@ -489,17 +613,14 @@ export default function App() {
           if (grp.length === 4) {
             fi += 2; mi += 2;
             grp.sort((a,b)=>a.t - b.t);
-            const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: toStr(s.t), stroke: "Frisim" }));
+            const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: s.tStr, stroke: "Frisim" }));
             teams.push({ name: `Lag ${t+1}`, legs, total: sum(grp.map(x=>x.t)) });
-          } else {
-            break;
-          }
+          } else break;
         }
         setGenerated({ note: teams.length === 0 ? "Inte tillräckligt med både Dam och Herr (behöver 2+2 per lag)." : null, teams });
         return;
       }
 
-      // icke-mix
       let chunks = [];
       if (buildStrategy === "fastest" || buildStrategy === "manual") {
         for (let i=0; i<relayTeams; i++) {
@@ -522,19 +643,16 @@ export default function App() {
       }
 
       const teams = chunks.map((grp, idx) => {
-        const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: toStr(s.t), stroke: "Frisim" }));
+        const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: s.tStr, stroke: "Frisim" }));
         return { name: `Lag ${idx+1}`, legs, total: sum(grp.map(x=>x.t)) };
       });
       setGenerated({ note: null, teams });
       return;
     }
 
-    // MEDLEY (4 ben)
-    if (reqKeys.length === 4) {
-      const is50Medley = /4x50\s*medley/i.test(normStr(relayType));
-      const order = is50Medley
-        ? ["rygg_50","brost_50","fjaril_50","frisim_50"]
-        : ["rygg_100","brost_100","fjaril_100","frisim_100"];
+    // Medley (4 ben)
+    if (needed.length === 4) {
+      const order = needed.slice();
       const legLabel = (k) => labelForKey(k);
 
       function mixOkAfterPick(currentLegs, candName) {
@@ -551,10 +669,10 @@ export default function App() {
       if (buildStrategy === "fastest") {
         const byLeg = {};
         for (const leg of order) {
-          byLeg[leg] = pool
-            .filter(s => s.nbest?.[leg]?.timeSec != null)
-            .map(s => ({ name: s.name, time: s.nbest[leg].timeSec, timeStr: secondsToTimeStr(s.nbest[leg].timeSec) }))
-            .sort((a,b)=>a.time - b.time);
+          const list = pool.map(s => ({ s, t: getTimeForPool(s.nbest, leg) }))
+            .filter(x => x.t && isFinite(x.t.timeSec))
+            .map(x => ({ name: x.s.name, time: x.t.timeSec, timeStr: x.t.timeStr }));
+          byLeg[leg] = list.sort((a,b)=>a.time - b.time);
         }
 
         const teams = [];
@@ -563,32 +681,40 @@ export default function App() {
         for (let t = 0; t < relayTeams; t++) {
           const usedInTeam = new Set();
           const legs = [];
+
           for (const leg of order) {
             const list = byLeg[leg];
             const pickIdx = list.findIndex(c =>
               !usedInTeam.has(c.name) &&
               !globallyUsed.has(c.name) &&
-              mixOkAfterPick(legs, c.name)
+              (ignoreGender || mixOkAfterPick(legs, c.name))
             );
             if (pickIdx !== -1) {
               const pick = list[pickIdx];
               legs.push({ leg: legLabel(leg), name: pick.name, time: pick.time, timeStr: pick.timeStr });
-              usedInTeam.add(pick.name); globallyUsed.add(pick.name);
+              usedInTeam.add(pick.name);
+              globallyUsed.add(pick.name);
             } else {
               legs.push({ leg: legLabel(leg), name: "(saknas)", time: NaN, timeStr: "" });
             }
           }
+
           const total = legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0);
           const complete = legs.every(l => isFinite(l.time));
-          const dam = legs.filter(L => genderOf.get(L.name) === "Dam").length;
-          const herr = legs.filter(L => genderOf.get(L.name) === "Herr").length;
 
-          if (complete && (!requireMix || (dam === 2 && herr === 2))) teams.push({ name: `Lag ${t+1}`, legs, total });
-          else break;
+          if (complete) {
+            if (!requireMix) {
+              teams.push({ name: `Lag ${t+1}`, legs, total });
+            } else {
+              const dam = legs.filter(L => genderOf.get(L.name) === "Dam").length;
+              const herr = legs.filter(L => genderOf.get(L.name) === "Herr").length;
+              if (dam === 2 && herr === 2) teams.push({ name: `Lag ${t+1}`, legs, total });
+            }
+          } else break;
         }
 
         setGenerated({
-          note: teams.length === 0 && requireMix ? "Inte tillräckligt med mix-kandidater (behöver 2 Dam + 2 Herr per lag och tider på alla ben)." : null,
+          note: (requireMix && teams.length === 0) ? "Inte tillräckligt med mix-kandidater (behöver 2 Dam + 2 Herr per lag och tider på alla ben)." : null,
           teams
         });
         return;
@@ -602,8 +728,9 @@ export default function App() {
       for (let li = 0; li < order.length; li++) {
         const legKey = order[li];
         let cand = pool
-          .filter(s => s.nbest?.[legKey]?.timeSec != null && !usedGlobal.has(s.name))
-          .map(s => ({ name: s.name, time: s.nbest[legKey].timeSec, timeStr: secondsToTimeStr(s.nbest[legKey].timeSec) }))
+          .map(s => ({ s, t: getTimeForPool(s.nbest, legKey) }))
+          .filter(x => x.t && isFinite(x.t.timeSec) && !usedGlobal.has(x.s.name))
+          .map(x => ({ name: x.s.name, time: x.t.timeSec, timeStr: x.t.timeStr }))
           .sort((a,b)=>a.time - b.time);
 
         const idxs = [...Array(relayTeams).keys()];
@@ -612,7 +739,7 @@ export default function App() {
         for (const ti of idxs) {
           const pickIdx = cand.findIndex(c =>
             !teamUsed[ti].has(c.name) &&
-            mixOkAfterPick(teams[ti].legs, c.name)
+            (ignoreGender || mixOkAfterPick(teams[ti].legs, c.name))
           );
           if (pickIdx !== -1) {
             const pick = cand.splice(pickIdx,1)[0];
@@ -627,7 +754,7 @@ export default function App() {
 
       teams.forEach(t => { t.total = t.legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0); });
 
-      // Balans (same-leg swaps), behåll 2+2
+      // Balans
       const spread = (ts) => Math.max(...ts.map(t=>t.total)) - Math.min(...ts.map(t=>t.total));
       const maxIter = 50;
       let improved = true, iter = 0;
@@ -644,13 +771,13 @@ export default function App() {
               const L1 = A.legs[legIdx], L2 = B.legs[legIdx];
               if (!isFinite(L1.time) || !isFinite(L2.time)) continue;
 
-              const g1 = normalizeGender(bestBySwimmer[L1.name]?.gender);
-              const g2 = normalizeGender(bestBySwimmer[L2.name]?.gender);
               if (requireMix) {
                 const cnt = (legs) => ({
                   dam: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Dam").length,
                   herr: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Herr").length
                 });
+                const g1 = normalizeGender(bestBySwimmer[L1.name]?.gender);
+                const g2 = normalizeGender(bestBySwimmer[L2.name]?.gender);
                 const cA = cnt(A.legs), cB = cnt(B.legs);
                 const newA_dam  = cA.dam  - (g1==="Dam")  + (g2==="Dam");
                 const newA_herr = cA.herr - (g1==="Herr") + (g2==="Herr");
@@ -708,7 +835,7 @@ export default function App() {
   // ---- UI ----
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
-      {/* Brandad header */}
+      {/* Header */}
       <div style={{
         display: "flex", alignItems: "center", gap: 12, marginBottom: 12, padding: 12,
         borderRadius: 12, background: "#fff", border: "1px solid #eee",
@@ -735,31 +862,53 @@ export default function App() {
       </div>
 
       <p style={{ marginBottom: 12 }}>
-        1) Ladda upp eller använd förvald CSV. 2) Klicka <strong>Validera fil</strong>. 3) Välj lagkapp, klass, förening & ålder och visa/generera lag.
+        1) Välj <strong>25m</strong> eller <strong>50m</strong> (förvald fil i root), eller ladda upp/ välj en annan CSV. 2) Filen valideras automatiskt. 3) Välj lagkapp, klass, förening & ålder och generera lag.
       </p>
 
+      {/* Fil-kontroller */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
-        <input
-          ref={fileRef}
-          type="file"
-          accept=".csv"
-          onChange={(e)=>{
-            const f = e.target.files?.[0];
-            if (!f) return;
-            const reader = new FileReader();
-            reader.onload = (ev) => {
-              setRawText(String(ev.target?.result || ""));
-              setDefaultFileName(f.name);
-              setErrors([]); setValidated(false); setGenerated(null);
-              setValStatus({ state: "idle", message: "" });
-            };
-            reader.readAsText(f, "utf-8");
-          }}
-        />
-        <button onClick={onValidate} disabled={!rawText} style={btnStyle}>Validera fil</button>
-        {defaultFileName && (
+        <button style={btnStyle} onClick={()=>handleLoadPreset("25m")}>25m</button>
+        <button style={btnStyle} onClick={()=>handleLoadPreset("50m")}>50m</button>
+
+        {/* Ladda upp egen CSV */}
+        <label style={{ ...btnSubtle, display: "inline-flex", alignItems: "center", gap: 8 }}>
+          Ladda upp egen fil (CSV)
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".csv"
+            style={{ display: "none" }}
+            onChange={(e)=>{
+              const f = e.target.files?.[0];
+              if (!f) return;
+              const reader = new FileReader();
+              reader.onload = (ev) => {
+                loadCsvTextAndValidate(String(ev.target?.result || ""), f.name);
+              };
+              reader.readAsText(f, "utf-8");
+              // rensa så man kan ladda samma fil igen direkt
+              e.target.value = "";
+            }}
+          />
+        </label>
+
+        {/* Välj annan CSV från root */}
+        <div style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+          <select
+            value={rootPick}
+            onChange={(e)=> setRootPick(e.target.value)}
+            style={selectStyleSmall}
+          >
+            {allCsvIndex.map(({path, name}) => (
+              <option key={path} value={path}>{name}</option>
+            ))}
+          </select>
+          <button style={btnStyle} onClick={handleLoadRootSelected}>Ladda vald CSV</button>
+        </div>
+
+        {activeFileName && (
           <span style={{ fontSize: 12, opacity: 0.8 }}>
-            Förvald fil: <strong>{defaultFileName}</strong>
+            Aktiv fil: <strong>{activeFileName}</strong>
           </span>
         )}
       </div>
@@ -811,36 +960,25 @@ export default function App() {
         </div>
       )}
 
-      {/* ===== Kontrollpanel alltid synlig – låst tills validerad ===== */}
-      <div style={{ marginTop: 8 }}>
-        <div>
-          <div style={cardBox}>
-            <fieldset disabled={!validated} style={{ border: 0, padding: 0, margin: 0, display: "block" }}>
-              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 2fr 2fr", gap: 12 }}>
+      {validated && (
+        <div style={{ marginTop: 8 }}>
+          <div>
+
+            {/* Val för lagkapp / klass / ålder / förening */}
+            <div style={cardBox}>
+              <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr 2fr", gap: 12 }}>
                 <div>
                   <label className="block" style={labelStyle}>Lagkapp</label>
                   <select value={relayType} onChange={(e)=>{ setRelayType(e.target.value); setGenerated(null); }} style={selectStyle}>
                     <option value="">Välj typ…</option>
-                    {["4x50 frisim","4x100 frisim","4x200 frisim","4x50 medley","4x100 medley"]
+                    {["4x25 frisim","4x50 frisim","4x100 frisim","4x200 frisim","4x50 medley","4x100 medley"]
                       .map((t)=> <option key={t} value={t}>{t}</option>)}
                   </select>
                 </div>
                 <div>
                   <label className="block" style={labelStyle}>Klass</label>
                   <select value={relayClass} onChange={(e)=>{ setRelayClass(e.target.value); setGenerated(null); }} style={selectStyle}>
-                    <option value="">Välj klass…</option>
-                    {["Herr","Dam","Mix"].map((c)=> <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="block" style={labelStyle}>Förening</label>
-                  <select
-                    value={selectedClub}
-                    onChange={(e)=>{ setSelectedClub(e.target.value); setGenerated(null); }}
-                    style={selectStyle}
-                  >
-                    <option value="">Alla föreningar</option>
-                    {availableClubs.map((c)=> <option key={c} value={c}>{c}</option>)}
+                    {["Alla","Herr","Dam","Mix"].map((c)=> <option key={c} value={c}>{c}</option>)}
                   </select>
                 </div>
                 <div>
@@ -855,6 +993,12 @@ export default function App() {
                     style={{...selectStyle, height: 96}}
                   >
                     {availableAges.map((a)=> <option key={a} value={a}>{a} år</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block" style={labelStyle}>Förening</label>
+                  <select value={clubSel} onChange={(e)=>{ setClubSel(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    {clubs.map(c => <option key={c} value={c}>{c}</option>)}
                   </select>
                 </div>
               </div>
@@ -877,7 +1021,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+              <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: "wrap" }}>
                 <button
                   style={btnStyle}
                   onClick={() => {
@@ -900,183 +1044,179 @@ export default function App() {
                   Generera lag
                 </button>
 
-                {reqKeys.length > 0 && (
+                {reqKeysBase.length > 0 && (
                   <span style={{ fontSize: 12, opacity: 0.8 }}>
-                    Visar: {reqKeys.map(labelForKey).join(', ')} • Förening: {selectedClub || "Alla"} • Lag: {relayTeams} • Strategi: {{
-                      fastest: 'Snabbaste laget', manual: 'Manuellt', even: 'Jämna lag'
-                    }[buildStrategy]}
+                    Visar ben: {reqKeysBase.map(labelForKey).join(', ')} • Antal lag: {relayTeams} • Strategi: {{
+                      fastest: 'Snabbaste', manual: 'Manuellt', even: 'Jämna'
+                    }[buildStrategy]} • Bassäng: {poolSel === "Alla" ? "25+50" : `${poolSel} m`} • Klass: {relayClass}
                   </span>
                 )}
               </div>
-            </fieldset>
-          </div>
-
-          {/* Simmare-rutan */}
-          {showSwimmersBox && (
-            <div style={{ ...cardBox, marginTop: 12 }}>
-              <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-                Alla simmare förvalda – klicka bort de som inte deltar. <br/>
-                <strong>Tips:</strong> Klicka på en tid eller “(saknas)” för att <em>redigera</em>. Enter = spara, Esc = avbryt, lämna tomt = ta bort.
-              </div>
-
-              {/* Knappar: markera/avmarkera alla */}
-              <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-                <button style={btnStyle} onClick={selectAllVisible} title="Markera alla synliga">Markera alla</button>
-                <button style={btnSubtle} onClick={clearAllSelected} title="Avmarkera alla">Avmarkera alla</button>
-              </div>
-
-              <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
-                <table className="min-w-full border-collapse">
-                  <thead>
-                    <tr>
-                      <th className="border px-2 py-1 text-left">Välj</th>
-                      <th className="border px-2 py-1 text-left">Namn</th>
-                      <th className="border px-2 py-1 text-left">Kön</th>
-                      <th className="border px-2 py-1 text-left">Ålder</th>
-                      <th className="border px-2 py-1 text-left">Förening</th>
-                      {reqKeys.map((k)=> (
-                        <th key={k} className="border px-2 py-1 text-left">{labelForKey(k)}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredSwimmers.map(({ name, gender, age, club, nbest }) => {
-                      const g = normalizeGender(gender);
-                      return (
-                        <tr key={name}>
-                          <td className="border px-2 py-1">
-                            <input type="checkbox" checked={selectedSwimmers.has(name)} onChange={()=>toggleSelect(name)} />
-                          </td>
-                          <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
-                          <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
-                          <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
-                          <td className="border px-2 py-1 whitespace-nowrap">{club || ""}</td>
-                          {reqKeys.map((k)=> {
-                            const cell = nbest?.[k];
-                            const isEditing = editing && editing.name === name && editing.key === k;
-                            const display = cell?.timeStr || "";
-                            const manual = !!cell?.manual;
-
-                            return (
-                              <td key={k} className="border px-2 py-1 whitespace-nowrap">
-                                {isEditing ? (
-                                  <input
-                                    autoFocus
-                                    type="text"
-                                    value={editing.value}
-                                    onChange={(e)=> setEditing(ed => ({ ...ed, value: e.target.value }))}
-                                    onBlur={() => {
-                                      const ok = updateTime(name, k, editing.value);
-                                      if (!ok) return;
-                                      setEditing(null);
-                                    }}
-                                    onKeyDown={(e) => {
-                                      if (e.key === "Enter") {
-                                        const ok = updateTime(name, k, editing.value);
-                                        if (ok) setEditing(null);
-                                      } else if (e.key === "Escape") {
-                                        setEditing(null);
-                                      }
-                                    }}
-                                    placeholder="mm:ss.hh eller ss.hh"
-                                    style={{ border: "1px solid #bbb", borderRadius: 6, padding: "4px 6px", minWidth: 90 }}
-                                  />
-                                ) : (
-                                  <span
-                                    onClick={() => setEditing({ name, key: k, value: display || "" })}
-                                    title="Klicka för att redigera"
-                                    style={{
-                                      cursor: "pointer",
-                                      fontStyle: manual ? "italic" : "normal",
-                                      color: manual ? "#1d39c4" : "inherit",
-                                    }}
-                                  >
-                                    {display || <span style={{ opacity: 0.5 }}>(saknas)</span>}
-                                    {manual && <span title="Manuellt satt tid"> *</span>}
-                                  </span>
-                                )}
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-
-              <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
-                Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
-              </div>
             </div>
-          )}
 
-          {/* Föreslagna lag – renderas när du klickat Generera lag */}
-          {generated && (
-            <div
-              style={{
-                ...cardBox,
-                marginTop: 12,
-                position: "relative",
-                overflow: "hidden",
-                backgroundImage: `url(${sssLogo})`,
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: "center 30%",
-                backgroundSize: "min(35vw, 280px)",
-                backgroundBlendMode: "soft-light",
-                isolation: "isolate"
-              }}
-            >
+            {showSwimmersBox && (
+              <div style={{ ...cardBox, marginTop: 12 }}>
+                <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
+                  Alla simmare förvalda – klicka bort de som inte deltar. <br/>
+                  <strong>Tips:</strong> Klicka på en tid eller “(saknas)” för att <em>redigera</em>. Enter = spara, Esc = avbryt, tomt = ta bort.
+                </div>
+
+                <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                  <button style={btnStyle} onClick={selectAllVisible} title="Markera alla synliga">Markera alla</button>
+                  <button style={btnSubtle} onClick={clearAllSelected} title="Avmarkera alla">Avmarkera alla</button>
+                </div>
+
+                <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, maxHeight: 420, overflow: "auto" }}>
+                  <table className="min-w-full border-collapse">
+                    <thead>
+                      <tr>
+                        <th className="border px-2 py-1 text-left">Välj</th>
+                        <th className="border px-2 py-1 text-left">Namn</th>
+                        <th className="border px-2 py-1 text-left">Kön</th>
+                        <th className="border px-2 py-1 text-left">Ålder</th>
+                        {reqKeysBase.map((k)=> (
+                          <th key={k} className="border px-2 py-1 text-left">
+                            {labelForKey(k)}{poolSel!=="Alla" ? ` (${poolSel}m)` : ""}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredSwimmers.map(({ name, gender, age, nbest }) => {
+                        const g = normalizeGender(gender);
+                        return (
+                          <tr key={name}>
+                            <td className="border px-2 py-1">
+                              <input type="checkbox" checked={selectedSwimmers.has(name)} onChange={()=>toggleSelect(name)} />
+                            </td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{name}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{g || ""}</td>
+                            <td className="border px-2 py-1 whitespace-nowrap">{Number.isFinite(age) ? age : ""}</td>
+                            {reqKeysBase.map((baseKey)=> {
+                              const cell = getTimeForPool(nbest, baseKey);
+                              const isEditing = editing && editing.name === name && editing.key === baseKey;
+                              const display = cell?.timeStr || "";
+                              const manual = !!cell?.manual;
+
+                              return (
+                                <td key={baseKey} className="border px-2 py-1 whitespace-nowrap">
+                                  {isEditing ? (
+                                    <input
+                                      autoFocus
+                                      type="text"
+                                      value={editing.value}
+                                      onChange={(e)=> setEditing(ed => ({ ...ed, value: e.target.value }))}
+                                      onBlur={() => {
+                                        const ok = updateTime(name, baseKey, editing.value);
+                                        if (!ok) return;
+                                        setEditing(null);
+                                      }}
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter") {
+                                          const ok = updateTime(name, baseKey, editing.value);
+                                          if (ok) setEditing(null);
+                                        } else if (e.key === "Escape") {
+                                          setEditing(null);
+                                        }
+                                      }}
+                                      placeholder="mm:ss.hh eller ss.hh"
+                                      style={{ border: "1px solid #bbb", borderRadius: 6, padding: "4px 6px", minWidth: 90 }}
+                                    />
+                                  ) : (
+                                    <span
+                                      onClick={() => setEditing({ name, key: baseKey, value: display || "" })}
+                                      title="Klicka för att redigera"
+                                      style={{
+                                        cursor: "pointer",
+                                        fontStyle: manual ? "italic" : "normal",
+                                        color: manual ? "#1d39c4" : "inherit",
+                                      }}
+                                    >
+                                      {display || <span style={{ opacity: 0.5 }}>(saknas)</span>}
+                                      {manual && <span title="Manuellt satt tid"> *</span>}
+                                    </span>
+                                  )}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+                  Valda simmare: {selectedSwimmers.size} {buildStrategy==="manual" && "(manuellt urval påverkar generering)"}
+                </div>
+              </div>
+            )}
+
+            {generated && (
               <div
                 style={{
-                  position: "absolute",
-                  inset: 0,
-                  background: isDark ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.75)",
-                  zIndex: 0
+                  ...cardBox,
+                  marginTop: 12,
+                  position: "relative",
+                  overflow: "hidden",
+                  backgroundImage: `url(${sssLogo})`,
+                  backgroundRepeat: "no-repeat",
+                  backgroundPosition: "center 30%",
+                  backgroundSize: "min(35vw, 280px)",
+                  backgroundBlendMode: "soft-light",
+                  isolation: "isolate"
                 }}
-              />
-              <div style={{ position: "relative", zIndex: 1 }}>
-                <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Föreslagna lag</h3>
-                {generated.note && <div style={noteBox("#fffbe6","#ad6800")}>⚠ {generated.note}</div>}
-                {generated.teams.length > 0 ? generated.teams.map((team, idx) => (
-                  <div key={idx} style={{ marginBottom: 12 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                      {team.name} — Total: {secondsToTimeStr(team.total)}
-                    </div>
-                    <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6, background: "#fff" }}>
-                      <thead>
-                        <tr>
-                          <th className="border px-2 py-1 text-left">Sträcka</th>
-                          <th className="border px-2 py-1 text-left">Simmare</th>
-                          <th className="border px-2 py-1 text-left">Tid</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {team.legs.map((L, i) => (
-                          <tr key={i}>
-                            <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
-                            <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
-                            <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
+              >
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    background: isDark ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.75)",
+                    zIndex: 0
+                  }}
+                />
+                <div style={{ position: "relative", zIndex: 1 }}>
+                  <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Föreslagna lag</h3>
+                  {generated.note && <div style={noteBox("#fffbe6","#ad6800")}>⚠ {generated.note}</div>}
+                  {generated.teams.length > 0 ? generated.teams.map((team, idx) => (
+                    <div key={idx} style={{ marginBottom: 12 }}>
+                      <div style={{ fontWeight: 700, marginBottom: 6 }}>
+                        {team.name} — Total: {secondsToTimeStr(team.total)}
+                      </div>
+                      <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6, background: "#fff" }}>
+                        <thead>
+                          <tr>
+                            <th className="border px-2 py-1 text-left">Sträcka</th>
+                            <th className="border px-2 py-1 text-left">Simmare</th>
+                            <th className="border px-2 py-1 text-left">Tid</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )) : <div style={{ fontSize: 14, opacity: 0.8 }}>Inga kompletta lag kunde genereras.</div>}
+                        </thead>
+                        <tbody>
+                          {team.legs.map((L, i) => (
+                            <tr key={i}>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
+                              <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )) : <div style={{ fontSize: 14, opacity: 0.8 }}>Inga kompletta lag kunde genereras.</div>}
+                </div>
               </div>
-            </div>
-          )}
-
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
 
 /* ====== Tema & UI ====== */
 const THEME = {
-  primary: "#f4c21f",     // gul från loggan
+  primary: "#f4c21f",
   primaryText: "#111",
   border: "#e5e5e5",
 };
@@ -1100,6 +1240,7 @@ const btnSubtle = {
 };
 
 const selectStyle = { border: `1px solid ${THEME.border}`, padding: 8, borderRadius: 8, width: "100%" };
+const selectStyleSmall = { ...selectStyle, width: 220 };
 const labelStyle  = { fontSize: 12, opacity: 0.8, marginBottom: 4 };
 const cardBox     = { border: `1px solid ${THEME.border}`, borderRadius: 12, padding: 12, background: "#fafafa" };
 
