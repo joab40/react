@@ -25,6 +25,8 @@ for (const p of Object.keys(allCsvFiles)) {
   }
 }
 
+const PRESENCE_KEY = "relay_presence_list_v1";
+
 export default function App() {
   // --- Data / validering ---
   const [rawText, setRawText] = useState("");
@@ -38,7 +40,7 @@ export default function App() {
   const [summary, setSummary] = useState(null);
 
   // --- UI-val ---
-  const [relayType, setRelayType] = useState("");       // 4x25/4x50/4x100/4x200 frisim, 4x50/4x100 medley
+  const [relayType, setRelayType] = useState("");       // 4x25/4x50/... frisim, medley-varianter
   const [relayClass, setRelayClass] = useState("Alla"); // Herr | Dam | Mix | Alla
   const [selectedAges, setSelectedAges] = useState([]); // multi-select ages
 
@@ -52,9 +54,12 @@ export default function App() {
   // Lista / generering
   const [showSwimmersBox, setShowSwimmersBox] = useState(false);
   const [selectedSwimmers, setSelectedSwimmers] = useState(new Set());
-  const [relayTeams, setRelayTeams] = useState(1);              // 1..5
+  const [relayTeams, setRelayTeams] = useState(1);              // 1..10
   const [buildStrategy, setBuildStrategy] = useState("manual"); // manual | fastest | even
   const [generated, setGenerated] = useState(null);
+
+  // Närvarolista (persist)
+  const [presenceText, setPresenceText] = useState("");
 
   // Inline-edit
   const [editing, setEditing] = useState(null); // { name, key, value }
@@ -62,10 +67,17 @@ export default function App() {
   // Statusrad
   const [valStatus, setValStatus] = useState({ state: "idle", message: "" });
 
-  // Visning av aktivt filnamn
+  // Filmeny / “aktiv fil”
   const [activeFileName, setActiveFileName] = useState("");
   const [rootPick, setRootPick] = useState(allCsvIndex[0]?.path || "");
-  const fileRef = useRef(null);
+  const uploadRef = useRef(null);
+
+  // Lokalt uppladdad fil (visas i dropdownen som "Lokal fil: ...")
+  const [uploadedName, setUploadedName] = useState("");
+  const [uploadedText, setUploadedText] = useState("");
+
+  // DnD state för lag
+  const [dragInfo, setDragInfo] = useState(null);
 
   // Dark mode
   const [isDark, setIsDark] = useState(() =>
@@ -86,13 +98,18 @@ export default function App() {
   }, []);
   const sssLogo = isDark ? sssLogoDark : sssLogoLight;
 
-  // Läs in första .csv (utan att auto-validera)
+  // Läs in första .csv (auto-validera ej) + närvarolista från localStorage
   useEffect(() => {
     if (defaultCsvText) {
       setRawText(defaultCsvText);
       const parts = (defaultCsvPath || "").split("/");
       setActiveFileName(parts[parts.length - 1] || "");
+      setValStatus({ state: "idle", message: "" });
     }
+    try {
+      const stored = localStorage.getItem(PRESENCE_KEY);
+      if (stored != null) setPresenceText(stored);
+    } catch {}
   }, []);
 
   // Inject spinner CSS
@@ -106,7 +123,7 @@ export default function App() {
     }
   }, []);
 
-  // === Hjälpare för fil-laddning (knapparna 25m / 50m / root-dropdown / egen uppladdning) ===
+  // === Hjälpare för fil-laddning (knapparna 25m / 50m / rotdropdown med uppladdning) ===
   function resetStateForNewFile(filename) {
     setActiveFileName(filename || "");
     setErrors([]);
@@ -129,7 +146,6 @@ export default function App() {
 
   function findFirstCsvByToken(token /* "25m" | "50m" */) {
     const low = String(token).toLowerCase();
-    // välj första som innehåller token + slutar på .csv
     for (const { path, name } of allCsvIndex) {
       const n = name.toLowerCase();
       if (n.endsWith(".csv") && n.includes(low)) return path;
@@ -148,17 +164,52 @@ export default function App() {
       setValStatus({ state: "error", message: "Kunde inte läsa förvald CSV." });
       return;
     }
+    setRootPick(path);
     loadCsvTextAndValidate(text, path.split("/").pop() || path);
   }
 
-  function handleLoadRootSelected() {
-    if (!rootPick) return;
-    const text = allCsvFiles[rootPick];
-    if (typeof text !== "string") {
-      setValStatus({ state: "error", message: "Kunde inte läsa vald CSV." });
+  // Map för smidig lookup både via path ("./SSS_5-18.csv") och bara filnamn ("SSS_5-18.csv")
+  const csvByName = useMemo(
+    () => new Map(allCsvIndex.map(({ path, name }) => [name, allCsvFiles[path]])),
+    []
+  );
+
+  function getCsvTextByRef(ref) {
+    if (ref === "__local__") return uploadedText || null;
+    if (typeof allCsvFiles[ref] === "string") return allCsvFiles[ref]; // exakt path
+    const justName = (ref || "").split("/").pop();
+    return csvByName.get(justName) ?? null; // fallback via namn
+  }
+
+  function handleRootMenuChange(e) {
+    const v = e.target.value;
+    if (v === "__upload__") {
+      uploadRef.current?.click();
       return;
     }
-    loadCsvTextAndValidate(text, rootPick.split("/").pop() || rootPick);
+    const text = getCsvTextByRef(v);
+    if (typeof text === "string") {
+      setRootPick(v);
+      const shownName = v === "__local__" ? (uploadedName || "Lokal fil") : (v.split("/").pop() || v);
+      loadCsvTextAndValidate(text, shownName);
+    } else {
+      setValStatus({ state: "error", message: "Kunde inte läsa vald CSV." });
+    }
+  }
+
+  function onUploadFromMenu(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const txt = String(ev.target?.result || "");
+      setUploadedName(f.name);
+      setUploadedText(txt);
+      setRootPick("__local__");
+      loadCsvTextAndValidate(txt, f.name);
+    };
+    reader.readAsText(f, "utf-8");
+    e.target.value = ""; // så man kan välja samma fil igen
   }
 
   // ---- CSV/parse helpers ----
@@ -236,7 +287,7 @@ export default function App() {
       .replace(/\s+/g," ").trim();
   }
 
-  // Event-nycklar (inkl. 25 frisim)
+  // Event-nycklar
   function normalizeEvent(e) {
     const s = normStr(e).replace(/meter|m\.|m /g, "m ").replace(/\s+/g, " ");
     const has25  = /(^|\s)25\s*m/.test(s)  || /\b25m\b/.test(s);
@@ -260,19 +311,19 @@ export default function App() {
     if (has100 && isBack)   return "rygg_100";
     if (has100 && isBreast) return "brost_100";
     if (has100 && isFly)    return "fjaril_100";
+
+    // Nytt: 200 på rygg/bröst/fjäril (för 4x200 medley)
+    if (has200 && isBack)   return "rygg_200";
+    if (has200 && isBreast) return "brost_200";
+    if (has200 && isFly)    return "fjaril_200";
+
     return null;
   }
 
   function parseTimeToSeconds(str) {
     if (!str) return NaN;
     const s = String(str).trim().replace(/,/g, ".");
-    const clean = s.replace(/[^0-9:\.]/g, "");
-    if (!clean) return NaN;
-    const parts = clean.split(":");
-    if (parts.length === 1) return parseFloat(parts[0]);
-    if (parts.length === 2) return parseInt(parts[0], 10) * 60 + parseFloat(parts[1]);
-    const h = parseInt(parts[0],10)||0, m = parseInt(parts[1],10)||0;
-    return h*3600 + m*60 + parseFloat(parts.slice(2).join(":"));
+    return s.split(":").reduce((acc, p) => acc * 60 + parseFloat(p || "0"), 0);
   }
 
   function secondsToTimeStr(sec) {
@@ -291,15 +342,24 @@ export default function App() {
     return "";
   }
 
+  // Lagstorlek beroende på lagkapp
+  function teamSizeForRelay(rt) {
+    const s = normStr(rt);
+    if (/^8x50\s*frisim/.test(s)) return 8;
+    return 4; // default
+  }
+
   // Vilka tider behövs beroende på lagkapp (event-keys utan pool)
   function requiredEventKeysBase(rt) {
     const s = normStr(rt);
     if (/4x25\s*frisim/.test(s))  return ["frisim_25"];
     if (/4x50\s*frisim/.test(s))  return ["frisim_50"];
+    if (/8x50\s*frisim/.test(s))  return ["frisim_50"]; // samma gren, annan lagstorlek
     if (/4x100\s*frisim/.test(s)) return ["frisim_100"];
     if (/4x200\s*frisim/.test(s)) return ["frisim_200"];
     if (/4x50\s*medley/.test(s))  return ["rygg_50","brost_50","fjaril_50","frisim_50"];
     if (/4x100\s*medley/.test(s)) return ["rygg_100","brost_100","fjaril_100","frisim_100"];
+    if (/4x200\s*medley/.test(s)) return ["rygg_200","brost_200","fjaril_200","frisim_200"];
     return [];
   }
 
@@ -309,9 +369,9 @@ export default function App() {
     const map = {
       frisim_25:"25 frisim",
       frisim_50:"50 frisim", frisim_100:"100 frisim", frisim_200:"200 frisim",
-      rygg_50:"50 rygg", rygg_100:"100 rygg",
-      brost_50:"50 bröst", brost_100:"100 bröst",
-      fjaril_50:"50 fjäril", fjaril_100:"100 fjäril",
+      rygg_50:"50 rygg", rygg_100:"100 rygg", rygg_200:"200 rygg",
+      brost_50:"50 bröst", brost_100:"100 bröst", brost_200:"200 bröst",
+      fjaril_50:"50 fjäril", fjaril_100:"100 fjäril", fjaril_200:"200 fjäril",
     };
     return map[baseKey] || baseKey;
   }
@@ -338,7 +398,7 @@ export default function App() {
     setEditing(null);
 
     if (!rawText) {
-      setValStatus({ state: "error", message: "Ingen fil inläst. Välj 25m/50m, ladda vald CSV i root eller ladda upp egen." });
+      setValStatus({ state: "error", message: "Ingen fil inläst. Välj 25m/50m, en CSV i menyn eller ladda upp egen." });
       setErrors(["Ingen fil inläst."]);
       return;
     }
@@ -417,7 +477,7 @@ export default function App() {
         else if (/\(50m\)/i.test(tavlingRaw) || /\b50m\b/.test(tavlingRaw) || /\(50m\)/i.test(grenRaw) || /\b50m\b/.test(grenRaw)) poolType = "50";
         if (poolType) seenPools.add(poolType);
 
-        // Ålder/klass: säsongsår − födelseår (Linus 2010 ⇒ 15 år 2025)
+        // Ålder/klass: säsongsår − födelseår
         let classAge = "";
         let bornYear = NaN;
         const bornField = String(r[bornCol] || "");
@@ -441,7 +501,7 @@ export default function App() {
         }
 
         const baseKey = normalizeEvent(gren);
-        if (name && baseKey && isFinite(sec) && (poolType === "25" || poolType === "50")) {
+        if (name && baseKey && isFinite(sec) && (poolType === "25" || "50")) {
           const fullKey = `${baseKey}_${poolType}`;
           const prev = best[name].nbest[fullKey];
           if (!prev || sec < prev.timeSec) {
@@ -486,6 +546,16 @@ export default function App() {
     return Array.from(s).sort((a,b)=>a-b);
   }, [bestBySwimmer]);
 
+  // Närvarolista -> normaliserad mängd
+  const presenceSet = useMemo(() => {
+    const lines = String(presenceText || "")
+      .replace(/\r/g, "")
+      .split("\n")
+      .map((x) => normStr(x))
+      .filter(Boolean);
+    return new Set(lines);
+  }, [presenceText]);
+
   // Filtrering + sortering i listan
   const filteredSwimmers = useMemo(() => {
     const list = Object.entries(bestBySwimmer).map(([name, data]) => ({ name, ...data }));
@@ -518,12 +588,18 @@ export default function App() {
     return arr;
   }, [bestBySwimmer, relayClass, selectedAges, buildStrategy, reqKeysBase, clubSel, poolSel]);
 
-  // Auto-bocka synliga när rutan öppnas
+  // Auto-bocka när listan öppnas – använd närvarolistan om den finns
+  function preselectUsingPresence() {
+    const allVisible = filteredSwimmers.map(s => s.name);
+    if (presenceSet.size === 0) return new Set(allVisible);
+    const onlyPresent = allVisible.filter((n) => presenceSet.has(normStr(n)));
+    return new Set(onlyPresent);
+  }
+
   useEffect(() => {
     if (!showSwimmersBox) return;
-    const all = new Set(filteredSwimmers.map(s => s.name));
-    setSelectedSwimmers(all);
-  }, [showSwimmersBox, filteredSwimmers]);
+    setSelectedSwimmers(preselectUsingPresence());
+  }, [showSwimmersBox, filteredSwimmers, presenceSet]);
 
   function toggleSelect(name) {
     setSelectedSwimmers(prev => {
@@ -574,6 +650,78 @@ export default function App() {
     return true;
   }
 
+  // ---- DnD hjälp ----
+  function swapLegs(t1, l1, t2, l2) {
+    setGenerated(prev => {
+      if (!prev) return prev;
+
+      const teams = prev.teams.map(t => ({ ...t, legs: t.legs.map(l => ({ ...l })) }));
+      const A = teams[t1], B = teams[t2];
+      const L1 = A.legs[l1], L2 = B.legs[l2];
+      if (!L1 || !L2) return prev;
+
+      // Endast samma sträcka/ben
+      if (L1.leg !== L2.leg) {
+        return { ...prev, note: "Byten måste ske på samma sträcka." };
+      }
+
+      const requireMix = (relayClass === "Mix");
+      const g = (n) => normalizeGender(bestBySwimmer[n]?.gender);
+
+      // simulera swap
+      const newAlegs = A.legs.slice(), newBlegs = B.legs.slice();
+      newAlegs[l1] = L2; newBlegs[l2] = L1;
+
+      function count(legs) {
+        return legs.reduce((acc, x) => {
+          const gg = g(x.name);
+          if (gg === "Dam") acc.dam++;
+          if (gg === "Herr") acc.herr++;
+          return acc;
+        }, { dam: 0, herr: 0 });
+      }
+
+      if (requireMix) {
+        const cA = count(newAlegs), cB = count(newBlegs);
+        // För 8x50 krävs 4+4, annars 2+2
+        const size = newAlegs.length;
+        const need = size === 8 ? 4 : 2;
+        if (!(cA.dam === need && cA.herr === need && cB.dam === need && cB.herr === need)) {
+          return { ...prev, note: `Byte stoppat: mix-lag måste vara ${need} Dam + ${need} Herr.` };
+        }
+      }
+
+      // applicera
+      A.legs = newAlegs; B.legs = newBlegs;
+      A.total = A.legs.reduce((s, l) => s + (isFinite(l.time) ? l.time : 0), 0);
+      B.total = B.legs.reduce((s, l) => s + (isFinite(l.time) ? l.time : 0), 0);
+
+      return { ...prev, note: null, teams };
+    });
+  }
+
+  function onDragStartRow(e, teamIdx, legIdx) {
+    setDragInfo({ teamIdx, legIdx });
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", JSON.stringify({ teamIdx, legIdx }));
+  }
+  function onDragOverRow(e) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+  }
+  function onDropRow(e, teamIdx, legIdx) {
+    e.preventDefault();
+    let src = dragInfo;
+    try {
+      const d = JSON.parse(e.dataTransfer.getData("text/plain") || "{}");
+      if (d.teamIdx != null) src = d;
+    } catch {}
+    if (!src) return;
+    if (src.teamIdx === teamIdx && src.legIdx === legIdx) return;
+    swapLegs(src.teamIdx, src.legIdx, teamIdx, legIdx);
+    setDragInfo(null);
+  }
+
   // ---- Laggenerering ----
   function generateTeams() {
     if (!relayType) { setGenerated(null); return; }
@@ -591,55 +739,57 @@ export default function App() {
     const genderOf = new Map(pool.map(p => [p.name, normalizeGender(p.gender)]));
 
     const needed = reqKeysBase.slice();
+    const teamSize = teamSizeForRelay(relayType);
 
-    // Enben (alla frisim-varianter inkl. 25)
+    // Enben (alla frisim-varianter inkl. 25, 50, 100, 200 – och 8x50)
     if (needed.length === 1 && needed[0].startsWith("frisim")) {
       const base = needed[0];
       const withTime = pool.map(p => ({ p, t: getTimeForPool(p.nbest, base) }))
         .filter(x => x.t && isFinite(x.t.timeSec))
         .map(x => ({ ...x.p, t: x.t.timeSec, tStr: x.t.timeStr }));
-      if (withTime.length < 4) { setGenerated({ note: "Färre än 4 med giltig tid.", teams: [] }); return; }
+      if (withTime.length < teamSize) { setGenerated({ note: `Färre än ${teamSize} med giltig tid.`, teams: [] }); return; }
       withTime.sort((a,b)=>a.t - b.t);
 
       if (requireMix) {
         const females = withTime.filter(p => genderOf.get(p.name) === "Dam");
         const males   = withTime.filter(p => genderOf.get(p.name) === "Herr");
+        const needEach = Math.floor(teamSize/2);
         let fi = 0, mi = 0;
         const teams = [];
         for (let t = 0; t < relayTeams; t++) {
           const grp = [];
-          if (fi + 2 <= females.length) grp.push(...females.slice(fi, fi+2));
-          if (mi + 2 <= males.length)   grp.push(...males.slice(mi, mi+2));
-          if (grp.length === 4) {
-            fi += 2; mi += 2;
+          if (fi + needEach <= females.length) grp.push(...females.slice(fi, fi+needEach));
+          if (mi + needEach <= males.length)   grp.push(...males.slice(mi, mi+needEach));
+          if (grp.length === teamSize) {
+            fi += needEach; mi += needEach;
             grp.sort((a,b)=>a.t - b.t);
             const legs = grp.map((s, i) => ({ leg: `Sträcka ${i+1}`, name: s.name, time: s.t, timeStr: s.tStr, stroke: "Frisim" }));
             teams.push({ name: `Lag ${t+1}`, legs, total: sum(grp.map(x=>x.t)) });
           } else break;
         }
-        setGenerated({ note: teams.length === 0 ? "Inte tillräckligt med både Dam och Herr (behöver 2+2 per lag)." : null, teams });
+        setGenerated({ note: teams.length === 0 ? `Inte tillräckligt med både Dam och Herr (behöver ${needEach}+${needEach} per lag).` : null, teams });
         return;
       }
 
       let chunks = [];
       if (buildStrategy === "fastest" || buildStrategy === "manual") {
         for (let i=0; i<relayTeams; i++) {
-          const grp = withTime.slice(i*4, i*4+4);
-          if (grp.length === 4) chunks.push(grp);
+          const grp = withTime.slice(i*teamSize, i*teamSize+teamSize);
+          if (grp.length === teamSize) chunks.push(grp);
         }
       } else if (buildStrategy === "even") {
         const Ts = Array.from({length: relayTeams}, ()=>[]);
         let forward = true, i = 0;
         for (const s of withTime) {
-          if (Ts[i].length < 4) Ts[i].push(s);
+          if (Ts[i].length < teamSize) Ts[i].push(s);
           if (forward) { i++; if (i >= relayTeams) { i = relayTeams - 1; forward = false; } }
           else { i--; if (i < 0) { i = 0; forward = true; } }
-          if (Ts[i]?.length === 4) {
-            const next = Ts.findIndex(t => t.length < 4);
+          if (Ts[i]?.length === teamSize) {
+            const next = Ts.findIndex(t => t.length < teamSize);
             if (next !== -1) i = next;
           }
         }
-        chunks = Ts.filter(t => t.length === 4);
+        chunks = Ts.filter(t => t.length === teamSize);
       }
 
       const teams = chunks.map((grp, idx) => {
@@ -650,7 +800,7 @@ export default function App() {
       return;
     }
 
-    // Medley (4 ben)
+    // Medley (4 ben – även 4x200 medley)
     if (needed.length === 4) {
       const order = needed.slice();
       const legLabel = (k) => labelForKey(k);
@@ -754,7 +904,7 @@ export default function App() {
 
       teams.forEach(t => { t.total = t.legs.reduce((s,l)=> s + (isFinite(l.time)?l.time:0), 0); });
 
-      // Balans
+      // Balans (för "even")
       const spread = (ts) => Math.max(...ts.map(t=>t.total)) - Math.min(...ts.map(t=>t.total));
       const maxIter = 50;
       let improved = true, iter = 0;
@@ -771,7 +921,7 @@ export default function App() {
               const L1 = A.legs[legIdx], L2 = B.legs[legIdx];
               if (!isFinite(L1.time) || !isFinite(L2.time)) continue;
 
-              if (requireMix) {
+              if (relayClass === "Mix") {
                 const cnt = (legs) => ({
                   dam: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Dam").length,
                   herr: legs.filter(x=>normalizeGender(bestBySwimmer[x.name]?.gender)==="Herr").length
@@ -816,14 +966,14 @@ export default function App() {
 
       const finalTeams = teams.filter(t => {
         const complete = t.legs.every(L => isFinite(L.time));
-        if (!requireMix) return complete;
+        if (relayClass !== "Mix") return complete;
         const dam = t.legs.filter(L => normalizeGender(bestBySwimmer[L.name]?.gender) === "Dam").length;
         const herr = t.legs.filter(L => normalizeGender(bestBySwimmer[L.name]?.gender) === "Herr").length;
         return complete && dam === 2 && herr === 2;
       });
 
       setGenerated({
-        note: requireMix && finalTeams.length < relayTeams ? "Vissa lag kunde inte göras till mix (kräver 2 Dam + 2 Herr med tider på alla ben)." : null,
+        note: relayClass === "Mix" && finalTeams.length < relayTeams ? "Vissa lag kunde inte göras till mix (kräver 2 Dam + 2 Herr med tider på alla ben)." : null,
         teams: finalTeams
       });
       return;
@@ -862,7 +1012,7 @@ export default function App() {
       </div>
 
       <p style={{ marginBottom: 12 }}>
-        1) Välj <strong>25m</strong> eller <strong>50m</strong> (förvald fil i root), eller ladda upp/ välj en annan CSV. 2) Filen valideras automatiskt. 3) Välj lagkapp, klass, förening & ålder och generera lag.
+        1) Välj <strong>25m</strong> eller <strong>50m</strong>, eller använd menyn för att välja/ladda upp CSV. <strong>Laddning & validering sker automatiskt.</strong> 2) Välj förening, lagkapp, klass & ålder och generera lag.
       </p>
 
       {/* Fil-kontroller */}
@@ -870,41 +1020,27 @@ export default function App() {
         <button style={btnStyle} onClick={()=>handleLoadPreset("25m")}>25m</button>
         <button style={btnStyle} onClick={()=>handleLoadPreset("50m")}>50m</button>
 
-        {/* Ladda upp egen CSV */}
-        <label style={{ ...btnSubtle, display: "inline-flex", alignItems: "center", gap: 8 }}>
-          Ladda upp egen fil (CSV)
-          <input
-            ref={fileRef}
-            type="file"
-            accept=".csv"
-            style={{ display: "none" }}
-            onChange={(e)=>{
-              const f = e.target.files?.[0];
-              if (!f) return;
-              const reader = new FileReader();
-              reader.onload = (ev) => {
-                loadCsvTextAndValidate(String(ev.target?.result || ""), f.name);
-              };
-              reader.readAsText(f, "utf-8");
-              // rensa så man kan ladda samma fil igen direkt
-              e.target.value = "";
-            }}
-          />
-        </label>
-
-        {/* Välj annan CSV från root */}
-        <div style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-          <select
-            value={rootPick}
-            onChange={(e)=> setRootPick(e.target.value)}
-            style={selectStyleSmall}
-          >
-            {allCsvIndex.map(({path, name}) => (
-              <option key={path} value={path}>{name}</option>
-            ))}
-          </select>
-          <button style={btnStyle} onClick={handleLoadRootSelected}>Ladda vald CSV</button>
-        </div>
+        {/* Dropdown: alla CSV i root + “Ladda upp egen fil (CSV)…” + ev. lokal fil */}
+        <select
+          value={rootPick}
+          onChange={handleRootMenuChange}
+          onInput={handleRootMenuChange}
+          style={selectStyleSmall}
+          title="Välj en CSV i root eller ladda upp egen"
+        >
+          <option value="__upload__">Ladda upp egen fil (CSV)…</option>
+          {uploadedName && <option value="__local__">Lokal fil: {uploadedName}</option>}
+          {allCsvIndex.map(({path, name}) => (
+            <option key={path} value={path}>{name}</option>
+          ))}
+        </select>
+        <input
+          ref={uploadRef}
+          type="file"
+          accept=".csv"
+          style={{ display: "none" }}
+          onChange={onUploadFromMenu}
+        />
 
         {activeFileName && (
           <span style={{ fontSize: 12, opacity: 0.8 }}>
@@ -964,15 +1100,29 @@ export default function App() {
         <div style={{ marginTop: 8 }}>
           <div>
 
-            {/* Val för lagkapp / klass / ålder / förening */}
+            {/* Val för förening / lagkapp / klass / ålder */}
             <div style={cardBox}>
-              <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr 2fr", gap: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "2fr 1.5fr 1fr 1fr", gap: 12 }}>
+                <div>
+                  <label className="block" style={labelStyle}>Förening</label>
+                  <select value={clubSel} onChange={(e)=>{ setClubSel(e.target.value); setGenerated(null); }} style={selectStyle}>
+                    {clubs.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
                 <div>
                   <label className="block" style={labelStyle}>Lagkapp</label>
                   <select value={relayType} onChange={(e)=>{ setRelayType(e.target.value); setGenerated(null); }} style={selectStyle}>
                     <option value="">Välj typ…</option>
-                    {["4x25 frisim","4x50 frisim","4x100 frisim","4x200 frisim","4x50 medley","4x100 medley"]
-                      .map((t)=> <option key={t} value={t}>{t}</option>)}
+                    {[
+                      "4x25 frisim",
+                      "4x50 frisim",
+                      "8x50 frisim",     // NY
+                      "4x100 frisim",
+                      "4x200 frisim",
+                      "4x50 medley",
+                      "4x100 medley",
+                      "4x200 medley"     // NY
+                    ].map((t)=> <option key={t} value={t}>{t}</option>)}
                   </select>
                 </div>
                 <div>
@@ -982,7 +1132,7 @@ export default function App() {
                   </select>
                 </div>
                 <div>
-                  <label className="block" style={labelStyle}>Åldersklasser (multi)</label>
+                  <label className="block" style={labelStyle}>Åldersklasser</label>
                   <select
                     multiple
                     value={selectedAges.map(String)}
@@ -991,14 +1141,9 @@ export default function App() {
                       setSelectedAges(vals); setGenerated(null);
                     }}
                     style={{...selectStyle, height: 96}}
+                    title="Markera en eller flera åldersklasser"
                   >
                     {availableAges.map((a)=> <option key={a} value={a}>{a} år</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="block" style={labelStyle}>Förening</label>
-                  <select value={clubSel} onChange={(e)=>{ setClubSel(e.target.value); setGenerated(null); }} style={selectStyle}>
-                    {clubs.map(c => <option key={c} value={c}>{c}</option>)}
                   </select>
                 </div>
               </div>
@@ -1008,12 +1153,16 @@ export default function App() {
                 <div>
                   <label className="block" style={labelStyle}>Antal lagkapper</label>
                   <select value={relayTeams} onChange={(e)=>{ setRelayTeams(Number(e.target.value)); setGenerated(null); }} style={selectStyle}>
-                    {[1,2,3,4,5].map(n=> <option key={n} value={n}>{n}</option>)}
+                    {[1,2,3,4,5,6,7,8,9,10].map(n=> <option key={n} value={n}>{n}</option>)}
                   </select>
                 </div>
                 <div>
                   <label className="block" style={labelStyle}>Strategi</label>
-                  <select value={buildStrategy} onChange={(e)=>{ setBuildStrategy(e.target.value); setGenerated(null); }} style={selectStyle}>
+                  <select
+                    value={buildStrategy}
+                    onChange={(e)=>{ setBuildStrategy(e.target.value); setGenerated(null); }}
+                    style={selectStyle}
+                  >
                     <option value="manual">Manuellt urval</option>
                     <option value="fastest">Snabbaste laget</option>
                     <option value="even">Jämna lag</option>
@@ -1021,16 +1170,49 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Närvarolista */}
+              <div style={{ marginTop: 12 }}>
+                <label className="block" style={labelStyle}>Närvarolista (klistra in namn, en per rad)</label>
+                <textarea
+                  value={presenceText}
+                  onChange={(e)=>setPresenceText(e.target.value)}
+                  rows={4}
+                  placeholder="Förnamn Efternamn&#10;Förnamn Efternamn&#10;…"
+                  style={{ width: "100%", border: `1px solid ${THEME.border}`, borderRadius: 8, padding: 8, fontFamily: "inherit" }}
+                />
+                <div style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <button
+                    style={btnSubtle}
+                    onClick={() => {
+                      try { localStorage.setItem(PRESENCE_KEY, presenceText); } catch {}
+                    }}
+                    title="Spara listan så den finns kvar nästa gång"
+                  >
+                    Spara lista
+                  </button>
+                  <button
+                    style={btnSubtle}
+                    onClick={() => { setPresenceText(""); try { localStorage.removeItem(PRESENCE_KEY); } catch {} }}
+                  >
+                    Rensa lista
+                  </button>
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>
+                    {presenceSet.size > 0
+                      ? `Sparad lista: ${presenceSet.size} namn. Används när du klickar “Visa alla simmare”.`
+                      : "Tom lista = alla simmare förvalda."}
+                  </span>
+                </div>
+              </div>
+
               <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: "wrap" }}>
                 <button
                   style={btnStyle}
                   onClick={() => {
-                    const all = new Set(filteredSwimmers.map(s => s.name));
-                    setSelectedSwimmers(all);
+                    setSelectedSwimmers(preselectUsingPresence());
                     setShowSwimmersBox(true);
                   }}
                   disabled={!relayType}
-                  title={!relayType ? "Välj lagkapp" : "Visa filtrerade simmare"}
+                  title={!relayType ? "Välj lagkapp" : "Öppna listan med simmare (förväljer närvarolistan om den finns)"}
                 >
                   Visa alla simmare
                 </button>
@@ -1058,7 +1240,7 @@ export default function App() {
               <div style={{ ...cardBox, marginTop: 12 }}>
                 <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Simmare</h3>
                 <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-                  Alla simmare förvalda – klicka bort de som inte deltar. <br/>
+                  Alla i närvarolistan (om angiven) är förvalda – klicka bort de som inte deltar. <br/>
                   <strong>Tips:</strong> Klicka på en tid eller “(saknas)” för att <em>redigera</em>. Enter = spara, Esc = avbryt, tomt = ta bort.
                 </div>
 
@@ -1184,6 +1366,7 @@ export default function App() {
                       <div style={{ fontWeight: 700, marginBottom: 6 }}>
                         {team.name} — Total: {secondsToTimeStr(team.total)}
                       </div>
+                      <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Tips: Dra & släpp en rad till ett annat lag (samma sträcka) för att byta simmare.</div>
                       <table className="min-w-full border-collapse" style={{ border: "1px solid #eee", borderRadius: 6, background: "#fff" }}>
                         <thead>
                           <tr>
@@ -1194,7 +1377,15 @@ export default function App() {
                         </thead>
                         <tbody>
                           {team.legs.map((L, i) => (
-                            <tr key={i}>
+                            <tr
+                              key={i}
+                              draggable={!!L.name && L.name !== "(saknas)"}
+                              onDragStart={(e)=>onDragStartRow(e, idx, i)}
+                              onDragOver={onDragOverRow}
+                              onDrop={(e)=>onDropRow(e, idx, i)}
+                              title="Dra & släpp på samma sträcka för att byta mellan lag"
+                              style={{ cursor: "grab" }}
+                            >
                               <td className="border px-2 py-1 whitespace-nowrap">{L.leg}</td>
                               <td className="border px-2 py-1 whitespace-nowrap">{L.name}</td>
                               <td className="border px-2 py-1 whitespace-nowrap">{L.timeStr || "-"}</td>
@@ -1240,7 +1431,7 @@ const btnSubtle = {
 };
 
 const selectStyle = { border: `1px solid ${THEME.border}`, padding: 8, borderRadius: 8, width: "100%" };
-const selectStyleSmall = { ...selectStyle, width: 220 };
+const selectStyleSmall = { ...selectStyle, width: 260 };
 const labelStyle  = { fontSize: 12, opacity: 0.8, marginBottom: 4 };
 const cardBox     = { border: `1px solid ${THEME.border}`, borderRadius: 12, padding: 12, background: "#fafafa" };
 
